@@ -1,0 +1,984 @@
+import React, { useState, useEffect } from 'react'
+import { api } from '../services/api'
+import { APP_DEALS_PRODUCTS, APP_RETAILER_PRODUCTS } from '../data/appCatalog'
+import AppHeader from '../components/App/AppHeader'
+import AppCategorySection from '../components/App/AppCategorySection'
+import AppWholesaleBanner from '../components/App/AppWholesaleBanner'
+import AppProductCard from '../components/App/AppProductCard'
+import AppServiceCard from '../components/App/AppServiceCard'
+import AppBottomNav from '../components/App/AppBottomNav'
+import AppFooterModal from '../components/App/AppFooterModal'
+import AuthPage from '../components/Auth/AuthPage'
+import AccountProfileView from '../components/Account/AccountProfileView'
+import AppProductDetails from '../components/App/AppProductDetails'
+import { useCurrentLocation } from '../hooks/useCurrentLocation'
+import DeliveryLocationModal from '../components/Location/DeliveryLocationModal'
+import AdminDashboard from './AdminDashboard'
+import '../styles/app.css'
+
+export function AppInterface({ onLogout }) {
+  const [activeTab, setActiveTab] = useState('home')
+  const [selectedProduct, setSelectedProduct] = useState(null)
+  const [activeFooterPage, setActiveFooterPage] = useState(null)
+  const { location, detectLocation, selectAddress } = useCurrentLocation()
+  const [isLocationModalOpen, setIsLocationModalOpen] = useState(false)
+  const [paymentMethod, setPaymentMethod] = useState('Cash on Delivery')
+  const [cartItems, setCartItems] = useState(() => {
+    try {
+      const saved = localStorage.getItem('subhone_app_cart')
+      return saved ? JSON.parse(saved) : []
+    } catch (e) {
+      return []
+    }
+  })
+
+  // Synchronize cartItems with localStorage whenever it changes
+  useEffect(() => {
+    try {
+      localStorage.setItem('subhone_app_cart', JSON.stringify(cartItems))
+    } catch (e) {}
+  }, [cartItems])
+
+  const [orders, setOrders] = useState([])
+  const cartCount = cartItems.reduce((acc, item) => acc + item.qty, 0)
+  
+  const [user, setUser] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('subhone_auth_user') || 'null')
+    } catch (e) {
+      return null
+    }
+  })
+
+  const [products, setProducts] = useState([])
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const [services, setServices] = useState([])
+  const [searchQuery, setSearchQuery] = useState('')
+  const [selectedCategory, setSelectedCategory] = useState('all')
+  const [toastMessage, setToastMessage] = useState(null)
+
+  const [dbStatus, setDbStatus] = useState({ connected: false, branch: 'vercel-dev' })
+
+  useEffect(() => {
+    loadCatalog()
+    checkConnection()
+    syncUserProfile()
+  }, [])
+
+  // Auto-reload catalog when navigating to product-related tabs
+  useEffect(() => {
+    if (activeTab === 'home' || activeTab === 'category' || activeTab === 'products') {
+      loadCatalog(false)
+    }
+  }, [activeTab])
+
+  // Real-time automatic synchronization: polling every 10s, tab focus, visibility change, and custom events
+  useEffect(() => {
+    const pollTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        loadCatalog(false)
+      }
+    }, 10000)
+
+    const handleFocus = () => loadCatalog(false)
+    window.addEventListener('focus', handleFocus)
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        loadCatalog(false)
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+
+    const handleCatalogRefresh = () => loadCatalog(true)
+    window.addEventListener('subhone_catalog_refresh', handleCatalogRefresh)
+
+    const handleStorage = (e) => {
+      if (e.key === 'subhone_catalog_timestamp') {
+        loadCatalog(false)
+      }
+    }
+    window.addEventListener('storage', handleStorage)
+
+    return () => {
+      clearInterval(pollTimer)
+      window.removeEventListener('focus', handleFocus)
+      document.removeEventListener('visibilitychange', handleVisibility)
+      window.removeEventListener('subhone_catalog_refresh', handleCatalogRefresh)
+      window.removeEventListener('storage', handleStorage)
+    }
+  }, [user?.role])
+
+  // Automatically fetch user orders whenever user logs in or switches to order tab
+  useEffect(() => {
+    loadOrders(user)
+  }, [user?.id, user?.email, user?.phone, activeTab])
+
+  async function loadOrders(currentUser = user) {
+    try {
+      const userParam = currentUser 
+        ? { id: currentUser.id, email: currentUser.email, phone: currentUser.phone }
+        : null
+      const dbOrders = await api.getOrders(userParam)
+      if (dbOrders && dbOrders.length > 0) {
+        setOrders(dbOrders.map(o => {
+          const rawDate = o.createdAt || o.created_at
+          const formattedDate = rawDate 
+            ? new Date(rawDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+            : 'Today'
+
+          const totalVal = Number(o.totalAmount || o.total_amount || o.total || 0)
+          const itemsCount = o.itemsCount || (o.items ? o.items.length : 1)
+          const orderNum = o.orderNumber || o.order_number || o.id
+
+          return {
+            id: orderNum,
+            dbId: o.id,
+            date: formattedDate,
+            itemsCount,
+            itemsSummary: o.itemsSummary || 'Healthcare essentials',
+            total: totalVal,
+            status: o.status === 'CONFIRMED' ? 'Order Confirmed • Packing' : (o.status || 'Out for Delivery'),
+            driverName: o.driverName || 'SubhOne Fleet Dispatch',
+            eta: o.eta || '10 mins',
+            items: o.items || []
+          }
+        }))
+      }
+    } catch (errOrders) {
+      console.warn('Orders database load in app:', errOrders)
+    }
+  }
+
+  async function syncUserProfile() {
+    try {
+      const queryKey = user?.email || user?.phone || user?.id
+      const isSuperAdmin = (user?.email || '').toLowerCase().trim() === 'subhonehealthgroup@gmail.com'
+      if (queryKey) {
+        const dbProfile = await api.getUserProfile(queryKey)
+        if (dbProfile) {
+          const updated = { ...user, ...dbProfile }
+          setUser(updated)
+          localStorage.setItem('subhone_auth_user', JSON.stringify(updated))
+        } else if (!isSuperAdmin) {
+          // Account was deleted from database
+          console.warn('User account deleted or removed from database. Terminating session.')
+          localStorage.removeItem('subhone_auth_user')
+          localStorage.removeItem('app_role')
+          setUser(null)
+          if (onLogout) onLogout()
+        }
+      }
+    } catch (e) {
+      console.warn('App user profile sync note:', e)
+    }
+  }
+
+  async function loadCatalog(showSpinner = false) {
+    if (showSpinner) setIsRefreshing(true)
+    try {
+      const [prodData, servData] = await Promise.all([
+        api.getProducts(),
+        api.getServices()
+      ])
+      
+      if (prodData && prodData.length > 0) {
+        const listedOnly = prodData.filter(p => p.is_listed !== false && p.isListed !== false)
+        if (user?.role === 'retailer') {
+          const retailerProducts = listedOnly.map(p => ({
+            ...p,
+            displayPrice: Number(p.retailerPrice) > 0 ? Number(p.retailerPrice) : p.price,
+            isWholesale: true
+          }))
+          setProducts(retailerProducts)
+        } else {
+          setProducts(listedOnly)
+        }
+      } else {
+        setProducts([])
+      }
+
+      if (servData && servData.length > 0) {
+        setServices(servData)
+      }
+
+      await loadOrders(user)
+    } catch (err) {
+      console.warn('Error loading catalog data from backend:', err)
+    } finally {
+      if (showSpinner) {
+        setTimeout(() => setIsRefreshing(false), 450)
+      }
+    }
+  }
+
+  async function checkConnection() {
+    const health = await api.checkHealth()
+    setDbStatus(health)
+  }
+
+  const handleAddToCart = (product) => {
+    setCartItems(prev => {
+      const existing = prev.find(i => String(i.id) === String(product.id) || (product.numericId && i.numericId === product.numericId))
+      if (existing) {
+        return prev.map(i => (String(i.id) === String(product.id) || (product.numericId && i.numericId === product.numericId))
+          ? { ...i, qty: i.qty + 1 }
+          : i
+        )
+      }
+      return [...prev, {
+        id: product.id,
+        numericId: product.numericId,
+        name: product.name,
+        pack: product.pack || product.subtitle || product.details || 'Pack',
+        price: product.price,
+        mrp: product.mrp || product.price,
+        qty: 1,
+        image: product.image
+      }]
+    })
+    showToast(`Added ${product.name} to cart`)
+  }
+
+  const handleUpdateQty = (id, delta) => {
+    setCartItems(prev => {
+      return prev.map(item => {
+        if (String(item.id) === String(id) || (item.numericId && String(item.numericId) === String(id))) {
+          const newQty = item.qty + delta
+          return newQty > 0 ? { ...item, qty: newQty } : null
+        }
+        return item
+      }).filter(Boolean)
+    })
+  }
+
+  const handlePlaceOrder = async (selectedPayment = 'COD') => {
+    if (cartItems.length === 0) return
+    const subtotal = cartItems.reduce((acc, i) => acc + (i.price * i.qty), 0)
+    const gst = Math.round(subtotal * 0.12)
+    const finalTotal = subtotal + gst
+
+    try {
+      const orderPayload = {
+        userId: user?.id || null,
+        totalAmount: finalTotal,
+        itemsCount: cartCount,
+        paymentMethod: selectedPayment,
+        deliveryAddress: location?.address || 'Retailer Hub, Kolkata, West Bengal 700001',
+        recipientName: user?.name || 'Retailer Pharmacy',
+        recipientPhone: user?.phone || '9876543210',
+        items: cartItems.map(i => ({
+          productId: (typeof i.id === 'string' && i.id.length > 20) ? i.id : null,
+          name: i.name,
+          price: i.price,
+          quantity: i.qty
+        }))
+      }
+
+      const res = await api.createOrder(orderPayload)
+      const placedId = res?.order?.id || ('SUBH-' + Math.floor(1000 + Math.random() * 9000))
+      
+      const newOrder = {
+        id: placedId,
+        date: 'Just now',
+        itemsCount: cartCount,
+        total: finalTotal,
+        status: 'Order Confirmed • Packing',
+        driverName: 'SubhOne Fleet Dispatch',
+        eta: '10 mins'
+      }
+      setOrders(prev => [newOrder, ...prev])
+      setCartItems([])
+      showToast(`Wholesale Order #${placedId} placed & saved in database!`)
+      setActiveTab('order')
+    } catch (err) {
+      console.error('App order failed:', err)
+      showToast('Order failed: ' + (err.message || 'Server error'))
+    }
+  }
+
+  const showToast = (msg) => {
+    setToastMessage(msg)
+    setTimeout(() => {
+      setToastMessage(null)
+    }, 2200)
+  }
+
+  const handleLogout = () => {
+    localStorage.removeItem('subhone_auth_user')
+    setUser(null)
+    showToast('Logged out from SubhOne')
+  }
+
+  const filteredProducts = products.filter(p => {
+    // Strictly exclude unlisted products
+    if (p.is_listed === false || p.isListed === false) return false
+
+    const pName = (p.name || '').toLowerCase()
+    const pCategory = (p.category || p.category_name || '').toLowerCase()
+    const pBrand = (p.brand || '').toLowerCase()
+    const pSubtitle = (p.subtitle || p.description || p.pack || '').toLowerCase()
+
+    const q = searchQuery.toLowerCase().trim()
+    const matchSearch = !q || 
+                        pName.includes(q) ||
+                        pCategory.includes(q) ||
+                        pBrand.includes(q) ||
+                        pSubtitle.includes(q)
+
+    let matchCategory = true
+    if (selectedCategory && selectedCategory !== 'all' && selectedCategory !== 'All') {
+      const cleanSelected = selectedCategory.toLowerCase().replace(/[^a-z0-9]/g, ' ').trim()
+      const cleanCat = pCategory.replace(/[^a-z0-9]/g, ' ').trim()
+      if (cleanCat.includes(cleanSelected) || cleanSelected.includes(cleanCat)) {
+        matchCategory = true
+      } else {
+        const selTokens = cleanSelected.split(/\s+/).filter(t => t.length > 2)
+        matchCategory = selTokens.length > 0 && selTokens.some(t => cleanCat.includes(t))
+      }
+    }
+
+    return matchSearch && matchCategory
+  })
+
+  // Full-screen Auth Page for Mobile App
+  if (activeTab === 'login' || activeTab === 'signup') {
+    return (
+      <AuthPage
+        initialMode={activeTab === 'signup' ? 'signup' : 'login'}
+        isApp={true}
+        onSuccess={(u) => {
+          setUser(u)
+          if (u.role === 'admin' || u.role === 'delivery_partner' || u.role === 'staff') {
+            window.location.reload()
+          } else {
+            setActiveTab('home')
+          }
+          showToast(`Welcome back, ${u.name}!`)
+        }}
+        onClose={() => setActiveTab('home')}
+      />
+    )
+  }
+
+  if (selectedProduct) {
+    return (
+      <AppProductDetails
+        product={selectedProduct}
+        onBack={() => setSelectedProduct(null)}
+        onAddToCart={handleAddToCart}
+      />
+    )
+  }
+
+  if (activeTab === 'admin') {
+    return (
+      <AdminDashboard 
+        onLogout={() => {
+          handleLogout()
+          setActiveTab('home')
+        }} 
+      />
+    )
+  }
+
+  return (
+    <div className="app-interface">
+      {/* App Header with Logo, Search, Deliver To, Cart, Logout */}
+      <AppHeader 
+        user={user}
+        onLogout={handleLogout}
+        onTabChange={setActiveTab} 
+        onSearch={setSearchQuery} 
+        cartCount={cartCount} 
+        location={location}
+        onOpenLocation={() => setIsLocationModalOpen(true)}
+      />
+
+      <main className="app-main-content">
+        {activeTab === 'home' && (
+          <div className="app-home-view-container">
+            {/* Quick Filter Strip & Visual Category Cards (Image 1 & Image 2) */}
+            <AppCategorySection onSelectCategory={(catId) => {
+              setSelectedCategory(catId)
+              setActiveTab('products')
+            }} />
+
+            {/* B2B Wholesale Pharmacy Hero Banner (Image 1) */}
+            <AppWholesaleBanner 
+              onExplore={() => setActiveTab('products')} 
+              onCatalog={() => setActiveFooterPage('license')} 
+            />
+
+            {/* Deals of the Day (Image 2) */}
+            <section className="app-deals-section">
+              <div className="app-deals-header-row">
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <h2 className="app-deals-title">Deals of the Day</h2>
+                  <button 
+                    type="button"
+                    onClick={() => {
+                      loadCatalog(true)
+                      showToast('Catalog updated with latest products')
+                    }}
+                    title="Refresh product catalog"
+                    aria-label="Refresh product catalog"
+                    style={{
+                      background: isRefreshing ? '#ecfdf5' : 'transparent',
+                      border: 'none',
+                      cursor: 'pointer',
+                      padding: '4px 6px',
+                      borderRadius: '6px',
+                      color: isRefreshing ? '#059669' : '#64748b',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                      fontSize: '11px',
+                      fontWeight: '600'
+                    }}
+                  >
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      style={{
+                        animation: isRefreshing ? 'spin 0.8s linear infinite' : 'none'
+                      }}
+                    >
+                      <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                    </svg>
+                    <span style={{ fontSize: '10.5px' }}>{isRefreshing ? 'Syncing...' : 'Live'}</span>
+                  </button>
+                </div>
+                <button 
+                  className="app-deals-view-all-link"
+                  onClick={() => setActiveTab('products')}
+                >
+                  View All ({filteredProducts.length}) →
+                </button>
+              </div>
+
+              <div className="app-deals-two-col-grid">
+                {filteredProducts.map(product => (
+                  <AppProductCard 
+                    key={product.id} 
+                    product={product} 
+                    onAddToCart={handleAddToCart}
+                    onProductClick={() => setSelectedProduct(product)}
+                  />
+                ))}
+              </div>
+            </section>
+          </div>
+        )}
+
+        {(activeTab === 'category' || activeTab === 'products') && (
+          <section className="app-tab-section">
+            <div className="app-tab-header">
+              <h2>Medicine Categories</h2>
+              <p>Explore authentic medicine batches sorted by therapeutic category.</p>
+            </div>
+            
+            {/* Visual Category Picker / Filter */}
+            <AppCategorySection onSelectCategory={(catId) => {
+              setSelectedCategory(catId)
+            }} />
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '14px 0 10px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ fontSize: '13px', fontWeight: '700', color: '#334155' }}>
+                  {selectedCategory === 'all' ? 'All Medicines' : `Category: ${selectedCategory.toUpperCase()}`} ({filteredProducts.length})
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    loadCatalog(true)
+                    showToast('Catalog updated with latest products')
+                  }}
+                  title="Check for new products"
+                  style={{
+                    background: '#f0fdf4',
+                    border: '1px solid #bbf7d0',
+                    borderRadius: '12px',
+                    padding: '2px 8px',
+                    fontSize: '11px',
+                    fontWeight: '700',
+                    color: '#166534',
+                    cursor: 'pointer',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px'
+                  }}
+                >
+                  <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#22c55e', display: 'inline-block' }}></span>
+                  {isRefreshing ? 'Syncing...' : 'Live Catalog'}
+                </button>
+              </div>
+              {selectedCategory !== 'all' && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedCategory('all')}
+                  style={{ background: 'none', border: 'none', color: '#166534', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}
+                >
+                  Clear Filter 
+                </button>
+              )}
+            </div>
+
+            <div className="app-deals-two-col-grid">
+                  {filteredProducts.map(product => (
+                    <AppProductCard 
+                      key={product.id} 
+                      product={product} 
+                      onAddToCart={handleAddToCart}
+                      onProductClick={() => setSelectedProduct(product)}
+                    />
+                  ))}
+            </div>
+          </section>
+        )}
+
+        {(activeTab === 'order' || activeTab === 'bookings') && (
+          <section className="app-tab-section">
+            <div className="app-tab-header">
+              <h2>My Wholesale Orders</h2>
+              <p>Track dispatch, courier delivery & invoice histories</p>
+            </div>
+
+            {orders.length === 0 ? (
+              <div className="app-empty-bookings-card">
+                <span className="app-empty-calendar-icon"></span>
+                <h3>No Recent Orders</h3>
+                <p>Your wholesale medicine shipments and dispatch tracking will appear here.</p>
+                <button 
+                  className="app-hero-orange-btn" 
+                  onClick={() => setActiveTab('category')}
+                >
+                  Order Medicines Now
+                </button>
+              </div>
+            ) : (
+              <div className="app-orders-list">
+                {orders.map(order => (
+                  <div key={order.id} className="app-order-card">
+                    <div className="app-order-card-header">
+                      <div>
+                        <div className="app-order-num">{order.id}</div>
+                        <div style={{ fontSize: '11.5px', color: '#64748b' }}>{order.date}</div>
+                      </div>
+                      <span className={`app-order-status-pill ${order.status.includes('Delivery') || order.status.includes('Packing') ? 'transit' : ''}`}>
+                        {order.status}
+                      </span>
+                    </div>
+
+                    {order.itemsSummary && (
+                      <div style={{ fontSize: '12.5px', fontWeight: '600', color: '#334155', margin: '6px 0 2px' }}>
+                        {order.itemsSummary}
+                      </div>
+                    )}
+
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '8px 0', fontSize: '13px' }}>
+                      <span style={{ color: '#475569' }}>
+                        {order.itemsCount} {order.itemsCount === 1 ? 'item' : 'items'}
+                      </span>
+                      <strong style={{ fontSize: '15px', color: '#0f172a' }}>
+                        ₹{order.total.toLocaleString()}
+                      </strong>
+                    </div>
+                    <div style={{ background: '#f8fafc', padding: '8px 12px', borderRadius: '10px', fontSize: '12px', color: '#475569', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span>{order.driverName}</span>
+                      <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                        <span style={{ fontWeight: '700', color: '#166534' }}>ETA: {order.eta}</span>
+                        <span style={{ background: '#dcfce7', color: '#15803d', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', fontWeight: '700' }}>
+                           Confirmed
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeTab === 'cart' && (
+          <section className="app-tab-section">
+            <div className="app-tab-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+              <div>
+                <h2>Retailer Wholesale Cart</h2>
+                <p>Review items, GST invoicing and confirm wholesale delivery</p>
+              </div>
+              {cartItems.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCartItems([])
+                    try { localStorage.removeItem('subhone_app_cart') } catch (e) {}
+                    showToast('Cart cleared')
+                  }}
+                  style={{
+                    background: '#fef2f2',
+                    color: '#dc2626',
+                    border: '1px solid #fecaca',
+                    padding: '6px 12px',
+                    borderRadius: '8px',
+                    fontSize: '12px',
+                    fontWeight: '700',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Clear Cart
+                </button>
+              )}
+            </div>
+
+            {cartItems.length === 0 ? (
+              <div className="app-empty-bookings-card">
+                <span className="app-empty-calendar-icon"></span>
+                <h3>Your Cart is Empty</h3>
+                <p>Add authentic medicine batches with distributor discounts to your wholesale order.</p>
+                <button 
+                  className="app-hero-orange-btn" 
+                  onClick={() => setActiveTab('category')}
+                >
+                  Explore Categories
+                </button>
+              </div>
+            ) : (
+              <div className="app-cart-view-container">
+                <div className="app-cart-items-list" style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                  {cartItems.map(item => (
+                    <div key={item.id || item.numericId} className="app-cart-card">
+                      <div className="app-cart-img-box">
+                        <img src={item.image || 'https://images.unsplash.com/photo-1584308666744-24d5c474f2ae?w=400&q=80'} alt={item.name} />
+                      </div>
+                      <div className="app-cart-info">
+                        <h4 className="app-cart-title">{item.name}</h4>
+                        <p className="app-cart-pack">{item.pack}</p>
+                        <div className="app-cart-pricing">
+                          <span className="app-cart-price">₹{item.price}</span>
+                          {item.mrp && item.mrp > item.price && (
+                            <span className="app-cart-mrp">₹{item.mrp}</span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="app-cart-qty-ctrls">
+                        <button 
+                          className="app-cart-qty-btn" 
+                          onClick={() => handleUpdateQty(item.id || item.numericId, -1)}
+                          aria-label="Decrease quantity"
+                        >
+                          −
+                        </button>
+                        <span className="app-cart-qty-val">{item.qty}</span>
+                        <button 
+                          className="app-cart-qty-btn" 
+                          onClick={() => handleUpdateQty(item.id || item.numericId, 1)}
+                          aria-label="Increase quantity"
+                        >
+                          +
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Bill Breakdown */}
+                {(() => {
+                  const subtotal = cartItems.reduce((acc, i) => acc + (i.price * i.qty), 0)
+                  const mrpTotal = cartItems.reduce((acc, i) => acc + ((i.mrp || i.price) * i.qty), 0)
+                  const retailerMarginSavings = Math.max(0, mrpTotal - subtotal)
+                  const gst = Math.round(subtotal * 0.12)
+                  const finalTotal = subtotal + gst
+
+                  return (
+                    <div className="app-cart-bill-card">
+                      <h4 style={{ margin: '0 0 12px', fontSize: '14px', fontWeight: '800', color: '#0f172a' }}>Wholesale Price Summary</h4>
+                      <div className="app-bill-row">
+                        <span>Items Subtotal ({cartCount} units)</span>
+                        <span>₹{subtotal.toLocaleString()}</span>
+                      </div>
+                      <div className="app-bill-row" style={{ color: '#166534', fontWeight: '600' }}>
+                        <span>Retailer Margin Discount</span>
+                        <span>−₹{retailerMarginSavings.toLocaleString()}</span>
+                      </div>
+                      <div className="app-bill-row">
+                        <span>Wholesale GST (12% input tax credit)</span>
+                        <span>+₹{gst.toLocaleString()}</span>
+                      </div>
+                      <div className="app-bill-row">
+                        <span>Express 30-min Fleet Delivery</span>
+                        <span style={{ color: '#166534', fontWeight: '700' }}>FREE</span>
+                      </div>
+                      <div className="app-bill-row total">
+                        <span>Total Payable</span>
+                        <span style={{ color: '#166534' }}>₹{finalTotal.toLocaleString()}</span>
+                      </div>
+
+                      {/* Delivery Destination Address Row */}
+                      <div 
+                        onClick={() => setIsLocationModalOpen(true)}
+                        style={{
+                          background: '#f8fafc',
+                          border: '1.5px solid #cbd5e1',
+                          borderRadius: '12px',
+                          padding: '10px 14px',
+                          marginTop: '14px',
+                          marginBottom: '10px',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between'
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span style={{ fontSize: '18px' }}></span>
+                          <div>
+                            <span style={{ fontSize: '10.5px', fontWeight: '800', color: '#64748b', textTransform: 'uppercase' }}>Delivery Address</span>
+                            <p style={{ margin: 0, fontSize: '12.5px', fontWeight: '700', color: '#0f172a', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '190px' }}>
+                              {location?.shortName || location?.address || 'Select Delivery Location'}
+                            </p>
+                          </div>
+                        </div>
+                        <span style={{ fontSize: '11.5px', fontWeight: '800', color: '#2563eb' }}>Change ▾</span>
+                      </div>
+
+                      <div className="app-checkout-sticky-bar">
+                        <button
+                          className="app-hero-orange-btn"
+                          style={{ width: '100%', height: '48px', fontSize: '15px', fontWeight: '800' }}
+                          onClick={() => setActiveTab('checkout_address')}
+                        >
+                          Place Wholesale Order (₹{finalTotal.toLocaleString()}) →
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })()}
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeTab === 'checkout_address' && (
+          <section className="app-tab-section" style={{ minHeight: '80vh', display: 'flex', flexDirection: 'column' }}>
+            <div className="app-tab-header">
+              <h2>Confirm Delivery Address</h2>
+              <p>Where should we deliver this wholesale order?</p>
+            </div>
+            
+            <div style={{ flex: 1, padding: '16px' }}>
+              <div 
+                style={{
+                  background: '#fff',
+                  border: '2px solid #0ea5e9',
+                  borderRadius: '12px',
+                  padding: '16px',
+                  marginBottom: '20px',
+                  boxShadow: '0 4px 6px -1px rgba(14,165,233,0.1)'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
+                  <div style={{ background: '#e0f2fe', color: '#0369a1', padding: '8px', borderRadius: '50%' }}>📍</div>
+                  <h3 style={{ margin: 0, fontSize: '16px', color: '#0f172a' }}>Delivery Location</h3>
+                </div>
+                <p style={{ margin: '0 0 16px 0', color: '#475569', fontSize: '14px', lineHeight: 1.5 }}>
+                  {location?.address || 'Retailer Hub, Kolkata, West Bengal 700001'}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setIsLocationModalOpen(true)}
+                  style={{
+                    background: '#f1f5f9',
+                    color: '#334155',
+                    border: '1px solid #cbd5e1',
+                    padding: '8px 16px',
+                    borderRadius: '8px',
+                    fontSize: '13px',
+                    fontWeight: '700',
+                    cursor: 'pointer',
+                    width: '100%'
+                  }}
+                >
+                  Change Address
+                </button>
+              </div>
+            </div>
+
+            <div className="app-checkout-sticky-bar" style={{ padding: '16px', background: '#fff', borderTop: '1px solid #e2e8f0' }}>
+              <button
+                className="app-hero-orange-btn"
+                style={{ width: '100%', height: '48px', fontSize: '15px', fontWeight: '800' }}
+                onClick={() => setActiveTab('checkout_payment')}
+              >
+                Confirm & Proceed to Payment →
+              </button>
+              <button
+                style={{ width: '100%', height: '40px', background: 'transparent', border: 'none', color: '#64748b', fontWeight: '600', marginTop: '8px', cursor: 'pointer' }}
+                onClick={() => setActiveTab('cart')}
+              >
+                Back to Cart
+              </button>
+            </div>
+          </section>
+        )}
+
+        {activeTab === 'checkout_payment' && (
+          <section className="app-tab-section" style={{ minHeight: '80vh', display: 'flex', flexDirection: 'column' }}>
+            <div className="app-tab-header">
+              <h2>Payment Method</h2>
+              <p>Select how you want to pay for your wholesale order</p>
+            </div>
+            
+            <div style={{ flex: 1, padding: '16px' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                {['Cash on Delivery', 'UPI / QR Scan on Delivery', 'Credit/Debit Card'].map(method => (
+                  <div 
+                    key={method}
+                    onClick={() => setPaymentMethod(method)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      background: '#fff',
+                      border: paymentMethod === method ? '2px solid #0ea5e9' : '1px solid #e2e8f0',
+                      borderRadius: '12px',
+                      padding: '16px',
+                      cursor: 'pointer',
+                      boxShadow: paymentMethod === method ? '0 4px 6px -1px rgba(14,165,233,0.1)' : 'none'
+                    }}
+                  >
+                    <span style={{ fontSize: '15px', fontWeight: '600', color: '#0f172a' }}>{method}</span>
+                    <div style={{ 
+                      width: '20px', 
+                      height: '20px', 
+                      borderRadius: '50%', 
+                      border: paymentMethod === method ? '6px solid #0ea5e9' : '2px solid #cbd5e1',
+                      background: '#fff'
+                    }}></div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="app-checkout-sticky-bar" style={{ padding: '16px', background: '#fff', borderTop: '1px solid #e2e8f0' }}>
+              <button
+                className="app-hero-orange-btn"
+                style={{ width: '100%', height: '48px', fontSize: '15px', fontWeight: '800' }}
+                onClick={() => handlePlaceOrder(paymentMethod)}
+              >
+                Confirm Order
+              </button>
+              <button
+                style={{ width: '100%', height: '40px', background: 'transparent', border: 'none', color: '#64748b', fontWeight: '600', marginTop: '8px', cursor: 'pointer' }}
+                onClick={() => setActiveTab('checkout_address')}
+              >
+                Back to Address
+              </button>
+            </div>
+          </section>
+        )}
+
+        {(activeTab === 'account' || activeTab === 'profile') && (
+          <section className="app-tab-section">
+            {user ? (
+              <AccountProfileView
+                user={user}
+                onUpdateUser={(updated) => setUser(updated)}
+                onLogout={handleLogout}
+                showToast={showToast}
+              />
+            ) : (
+              <div className="app-account-summary-card" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '14px', width: '100%' }}>
+                  <div className="app-user-avatar-lg" style={{ background: '#eff6ff', color: '#2563eb' }}></div>
+                  <div className="app-account-meta">
+                    <h3 style={{ margin: 0 }}>Guest Retailer</h3>
+                    <p style={{ margin: '2px 0 0' }}>Sign in to view wholesale margins & order medicine batches</p>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '10px', marginTop: '14px', width: '100%' }}>
+                  <button 
+                    className="app-hero-orange-btn" 
+                    style={{ flex: 1, height: '42px', fontSize: '13px', background: '#2563eb' }}
+                    onClick={() => setActiveTab('login')}
+                  >
+                    Sign In to App
+                  </button>
+                  <button 
+                    className="app-catalog-white-btn" 
+                    style={{ flex: 1, height: '42px', fontSize: '13px' }}
+                    onClick={() => setActiveTab('signup')}
+                  >
+                    Register Retailer
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="app-account-quick-links">
+              <div className="app-account-link-item" onClick={() => setActiveFooterPage('license')}>
+                <span>Wholesale Pharmacy License & FSSAI</span>
+                <span>›</span>
+              </div>
+              <div className="app-account-link-item" onClick={() => setActiveFooterPage('about')}>
+                <span>About Subhone Health Group</span>
+                <span>›</span>
+              </div>
+              <div className="app-account-link-item" onClick={() => setActiveFooterPage('terms')}>
+                <span>Wholesale Terms & Conditions</span>
+                <span>›</span>
+              </div>
+              <div className="app-account-link-item" onClick={() => setActiveFooterPage('returns')}>
+                <span>Return & Replacement Policy</span>
+                <span>›</span>
+              </div>
+              <div className="app-account-link-item" onClick={() => setActiveFooterPage('privacy')}>
+                <span>Privacy & Data Protection</span>
+                <span>›</span>
+              </div>
+            </div>
+          </section>
+        )}
+      </main>
+
+      {/* Clickable Fixed Bottom Navigation Bar */}
+      <AppBottomNav activeTab={activeTab} onTabChange={setActiveTab} cartCount={cartCount} />
+
+      {/* Modal Page Viewer for Footer/Legal Links */}
+      {activeFooterPage && (
+        <AppFooterModal 
+          pageKey={activeFooterPage} 
+          onClose={() => setActiveFooterPage(null)} 
+        />
+      )}
+
+      {/* Delivery Address & Location Modal (Powered by Google Maps & GPS) */}
+      <DeliveryLocationModal 
+        isOpen={isLocationModalOpen} 
+        onClose={() => setIsLocationModalOpen(false)} 
+        location={location}
+        detectLocation={detectLocation}
+        onSelectAddress={(addr) => {
+          if (selectAddress) selectAddress(addr)
+          showToast(`Delivery location set to: ${addr.line1 || addr.shortName || addr.city}`)
+        }}
+        user={user}
+      />
+
+      {/* Toast Feedback Notification */}
+      {toastMessage && (
+        <div className="app-toast-alert">
+          <span> {toastMessage}</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default AppInterface

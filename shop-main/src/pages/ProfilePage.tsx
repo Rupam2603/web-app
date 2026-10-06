@@ -1,0 +1,1493 @@
+import React, { useState, useRef, useEffect } from "react";
+import type { CurrentUser, Address, Page } from "../App";
+import {
+  fetchUserAddresses,
+  createAddress as dbCreateAddress,
+  updateAddress as dbUpdateAddress,
+  deleteAddress as dbDeleteAddress,
+  setDefaultAddress as dbSetDefaultAddress,
+  DbAddress,
+} from "../lib/addresses";
+import { fetchUserOrders, DbOrder } from "../lib/orders";
+import { fetchUserLabBookings, DbLabBooking } from "../lib/labTests";
+import { fetchUserReviews, submitReview, type DbReview } from "../lib/reviews";
+import { useModalBackHandler } from "../lib/navigation";
+import { StarRow } from "../components/ProductModal";
+import { printOrDownloadInvoice, InvoiceOrderData, formatOrderAddress } from "../lib/invoiceGenerator";
+import { supabase } from "../lib/supabase";
+import { subscribeToOrderEvents } from "../lib/orderEvents";
+
+type ProfileSection = "profile" | "addresses" | "orders" | "lab-tests" | "reviews" | "security";
+
+const CUSTOMER_ORDERS = [
+  { id: "ORD-3041", date: "Aug 28, 2026", status: "Processing", total: 212,  items: ["Volini Spray 249ml", "Dettol Antiseptic 60ml", "Eno Lemon Sachet 5g"] },
+  { id: "ORD-2991", date: "Aug 22, 2026", status: "Delivered",  total: 671,  items: ["Dabur Chyawanprash 860g"] },
+  { id: "ORD-2843", date: "Aug 19, 2026", status: "Delivered",  total: 296,  items: ["Hansaplast Regular Band-Aid", "Dettol Antiseptic 250ml"] },
+  { id: "ORD-2756", date: "Aug 14, 2026", status: "Delivered",  total: 412,  items: ["Glucon D Orange Jar 415g", "Electrol Sachet ×3", "Sugar Free Gold 40 Tabs"] },
+  { id: "ORD-2601", date: "Aug 6, 2026",  status: "Cancelled",  total: 215,  items: ["Zandu Nityam Tablets ×2", "Kayam Churna 115g"] },
+];
+
+const RETAILER_ORDERS = [
+  { id: "BLK-1041", date: "Aug 28, 2026", status: "Processing", total: 4770,  items: ["Volini Gel 15g ×50", "Dettol Antiseptic 250ml ×20"] },
+  { id: "BLK-0992", date: "Aug 23, 2026", status: "Delivered",  total: 11560, items: ["Glucon D Orange Jar 415g ×30", "Sugar Free Gold 40 Tabs ×50"] },
+  { id: "BLK-0876", date: "Aug 17, 2026", status: "Delivered",  total: 7770,  items: ["Hansaplast Regular Band-Aid ×40", "Boroline Antiseptic Cream 45g ×30"] },
+  { id: "BLK-0741", date: "Aug 10, 2026", status: "Shipped",    total: 4160,  items: ["Nycil Cool Powder 130g ×25", "Ring Guard Cream 96g ×20"] },
+  { id: "BLK-0654", date: "Aug 3, 2026",  status: "Delivered",  total: 4100,  items: ["Dettol Hand Sanitizer 30ml ×100", "Surgical Face Mask 75pc ×20"] },
+];
+
+function orderStatusStyle(s: string): { color: string; bg: string } {
+  switch (s) {
+    case "Delivered":        return { color: "#047857", bg: "#d1fae5" };
+    case "Out for Delivery": return { color: "#0284c7", bg: "#e0f2fe" };
+    case "Shipped":          return { color: "#1d4ed8", bg: "#dbeafe" };
+    case "Dispatched":
+    case "Dispatch":         return { color: "#7c3aed", bg: "#ede9fe" };
+    case "Processing":       return { color: "#d97706", bg: "#fef3c7" };
+    case "Cancelled":        return { color: "#b91c1c", bg: "#fee2e2" };
+    default:                 return { color: "#374151", bg: "#f3f4f6" };
+  }
+}
+
+const ADDR_LABEL_COLORS: Record<string, { color: string; bg: string }> = {
+  "Home":  { color: "#ff3366", bg: "#fff1f2" },
+  "Work":  { color: "#0369a1", bg: "#e0f2fe" },
+  "Shop":  { color: "#d97706", bg: "#fef3c7" },
+  "Other": { color: "#374151", bg: "#f3f4f6" },
+};
+
+const emptyAddr = (): Partial<Address> => ({
+  id: "", label: "Home", name: "", phone: "", line1: "", line2: "",
+  city: "", state: "", pincode: "", isDefault: false,
+});
+
+const INPUT_CLS = "w-full bg-[#f8fafc] border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm text-slate-800 focus:outline-none transition-colors placeholder:text-slate-400";
+
+export default function ProfilePage({
+  user,
+  onUpdateUser,
+  onNavigate,
+  onTrackOrder,
+}: {
+  user: CurrentUser;
+  onUpdateUser: (updates: Partial<CurrentUser>) => void;
+  onNavigate: (page: Page) => void;
+  onTrackOrder?: (orderNumber?: string) => void;
+}) {
+  const [section, setSection] = useState<ProfileSection>("profile");
+  const [dbAddresses, setDbAddresses] = useState<DbAddress[]>([]);
+  const [dbOrders, setDbOrders] = useState<DbOrder[]>([]);
+  const [dbLabBookings, setDbLabBookings] = useState<DbLabBooking[]>([]);
+  const [dbReviews, setDbReviews] = useState<DbReview[]>([]);
+  const [reviewModal, setReviewModal] = useState<{ open: boolean; productName: string; rating: number; title: string; comment: string; submitting: boolean }>({
+    open: false,
+    productName: "",
+    rating: 5,
+    title: "",
+    comment: "",
+    submitting: false,
+  });
+
+  useEffect(() => {
+    let mounted = true;
+
+    const loadOrders = () => {
+      fetchUserOrders(user.id).then((data) => {
+        if (mounted) setDbOrders(data);
+      }).catch((err) => {
+        console.error("Failed to load user orders:", err);
+      });
+    };
+
+    const loadAddresses = () => {
+      fetchUserAddresses(user.id).then((data) => {
+        if (mounted) setDbAddresses(data);
+      }).catch((err) => {
+        console.error("Failed to load user addresses:", err);
+      });
+    };
+
+    loadAddresses();
+    loadOrders();
+
+    fetchUserLabBookings().then((data) => {
+      if (mounted) setDbLabBookings(data);
+    });
+    fetchUserReviews(user.id).then((data) => {
+      if (mounted) setDbReviews(data);
+    });
+
+    // Real-time event subscription for immediate order updates (created, assigned, status changes)
+    const unsubEvents = subscribeToOrderEvents(() => {
+      loadOrders();
+    });
+
+    // Auto-refresh interval (5s when tab is active, 15s in background)
+    const pollInterval = setInterval(() => {
+      if (!mounted) return;
+      if (document.hidden) return;
+      loadOrders();
+    }, 5000);
+
+    // Refresh immediately when returning to tab
+    const handleVisibility = () => {
+      if (!document.hidden && mounted) {
+        loadOrders();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", handleVisibility);
+
+    return () => {
+      mounted = false;
+      unsubEvents();
+      clearInterval(pollInterval);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", handleVisibility);
+    };
+  }, [user.id]);
+
+  const accent = user.role === "retailer" ? "#ff3366" : "#0369a1";
+
+  // Combine live db addresses with fallback to legacy user.addresses
+  const addresses: Address[] = dbAddresses.length > 0
+    ? dbAddresses.map((a) => ({
+        id: a.id,
+        label: a.label,
+        name: a.name,
+        phone: a.phone,
+        line1: a.line1,
+        line2: a.line2 || undefined,
+        city: a.city,
+        state: a.state,
+        pincode: a.pincode,
+        isDefault: a.is_default,
+      }))
+    : user.addresses ?? [];
+
+  // Combine live orders with fallback, ensuring every order has a distinct invoice number
+  const displayOrders = dbOrders.length > 0
+    ? dbOrders.map((o, idx) => ({
+        id: o.order_number,
+        dbId: o.id,
+        invoiceNumber: o.invoice_number || `INV-${String(idx + 1).padStart(3, "0")}`,
+        createdAt: o.created_at,
+        date: new Date(o.created_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }),
+        status: o.status,
+        total: Number(o.total_amount),
+        items: o.order_items?.map((item) => `${item.product_name} ×${item.quantity}`) || ["Order items"],
+        deliveryPartnerId: o.delivery_partner_id,
+        deliveryStatus: o.delivery_status,
+        deliveryPartnerName: o.delivery_partner_name,
+        deliveryPartnerPhone: o.delivery_partner_phone,
+      }))
+    : (user.role === "retailer" ? RETAILER_ORDERS : CUSTOMER_ORDERS).map((o, idx) => ({
+        ...o,
+        invoiceNumber: `INV-${String(idx + 1).padStart(3, "0")}`,
+      }));
+
+  const totalSpent = displayOrders.filter((o) => o.status !== "Cancelled").reduce((s, o) => s + o.total, 0);
+
+  // ── Profile tab state ──
+  const [editName, setEditName] = useState(user.name);
+  const [editPhone, setEditPhone] = useState(user.phone ?? "");
+  const [editShop, setEditShop] = useState(user.shopName ?? "");
+  const [avatarPreview, setAvatarPreview] = useState<string | undefined>(user.profileImage);
+  const [saved, setSaved] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [profileMsg, setProfileMsg] = useState("");
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [photoMsg, setPhotoMsg] = useState("");
+  const imageRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setAvatarPreview(user.profileImage);
+  }, [user.profileImage]);
+
+  const handleProfileImage = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      setPhotoMsg("Please choose an image file (PNG, JPG, or WebP).");
+      setTimeout(() => setPhotoMsg(""), 4000);
+      return;
+    }
+
+    setUploadingPhoto(true);
+    setPhotoMsg("Optimizing and saving photo to database...");
+
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const rawDataUrl = ev.target?.result as string;
+      if (!rawDataUrl) {
+        setUploadingPhoto(false);
+        return;
+      }
+
+      const img = new Image();
+      img.onload = async () => {
+        let finalImage = rawDataUrl;
+        try {
+          const canvas = document.createElement("canvas");
+          const MAX_SIZE = 360;
+          let width = img.width;
+          let height = img.height;
+          if (width > height) {
+            if (width > MAX_SIZE) {
+              height = Math.round((height * MAX_SIZE) / width);
+              width = MAX_SIZE;
+            }
+          } else {
+            if (height > MAX_SIZE) {
+              width = Math.round((width * MAX_SIZE) / height);
+              height = MAX_SIZE;
+            }
+          }
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            ctx.drawImage(img, 0, 0, width, height);
+            finalImage = canvas.toDataURL("image/jpeg", 0.88);
+          }
+        } catch {}
+
+        setAvatarPreview(finalImage);
+
+        try {
+          await onUpdateUser({ profileImage: finalImage });
+          setPhotoMsg("Profile picture saved to database!");
+          setTimeout(() => setPhotoMsg(""), 4000);
+        } catch (err: any) {
+          console.error("Failed to save photo:", err);
+          setPhotoMsg("Failed to save photo to database: " + (err?.message || "Error"));
+          setTimeout(() => setPhotoMsg(""), 4000);
+        } finally {
+          setUploadingPhoto(false);
+        }
+      };
+
+      img.onerror = async () => {
+        setAvatarPreview(rawDataUrl);
+        try {
+          await onUpdateUser({ profileImage: rawDataUrl });
+          setPhotoMsg("Profile picture saved to database!");
+          setTimeout(() => setPhotoMsg(""), 4000);
+        } catch (err: any) {
+          console.error("Failed to save photo:", err);
+          setPhotoMsg("Failed to save photo to database.");
+          setTimeout(() => setPhotoMsg(""), 4000);
+        } finally {
+          setUploadingPhoto(false);
+        }
+      };
+
+      img.src = rawDataUrl;
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+
+  const handleSaveProfile = async () => {
+    setSavingProfile(true);
+    setProfileMsg("");
+    try {
+      await onUpdateUser({
+        name: editName.trim() || user.name,
+        phone: editPhone,
+        shopName: user.role === "retailer" ? editShop : undefined,
+        profileImage: avatarPreview !== undefined ? avatarPreview : user.profileImage,
+      });
+      setSaved(true);
+      setProfileMsg("Profile updated successfully in database!");
+      setTimeout(() => setSaved(false), 3000);
+    } catch (err: any) {
+      console.error("Failed to save profile:", err);
+      setProfileMsg(err?.message || "Failed to update profile.");
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
+  // ── Addresses tab state ──
+  const [addrModal, setAddrModal] = useState<{
+    open: boolean; mode: "add" | "edit"; idx: number | null; form: Partial<Address>;
+  }>({ open: false, mode: "add", idx: null, form: emptyAddr() });
+  const [addrSaving, setAddrSaving] = useState(false);
+  const [addrError, setAddrError] = useState("");
+
+  const openAddAddr  = () => {
+    setAddrError("");
+    setAddrModal({ open: true, mode: "add",  idx: null, form: emptyAddr() });
+  };
+  const openEditAddr = (idx: number) => {
+    setAddrError("");
+    setAddrModal({ open: true, mode: "edit", idx, form: { ...addresses[idx] } });
+  };
+  const closeAddrModal = () => {
+    setAddrError("");
+    setAddrSaving(false);
+    setAddrModal((p) => ({ ...p, open: false }));
+  };
+
+  useModalBackHandler(addrModal.open, closeAddrModal, "profile-address");
+
+  const saveAddress = async () => {
+    const f = addrModal.form as Address;
+    if (!f.name?.trim() || !f.line1?.trim() || !f.city?.trim() || !f.pincode?.trim()) {
+      setAddrError("Please fill in all required fields (Name, Street Address, City, PIN code).");
+      return;
+    }
+
+    setAddrSaving(true);
+    setAddrError("");
+    try {
+      if (addrModal.mode === "add") {
+        const { data, error } = await dbCreateAddress({
+          label: f.label || "Home",
+          name: f.name.trim(),
+          phone: f.phone?.trim() || "",
+          line1: f.line1.trim(),
+          line2: f.line2 ? f.line2.trim() : null,
+          city: f.city.trim(),
+          state: f.state.trim(),
+          pincode: f.pincode.trim(),
+          is_default: addresses.length === 0 || !!f.isDefault,
+        }, user.id);
+
+        if (error && !data) {
+          throw new Error(error);
+        }
+        if (data) {
+          setDbAddresses((prev) => {
+            const next = data.is_default ? prev.map(a => ({ ...a, is_default: false })) : [...prev];
+            return [...next, data];
+          });
+        }
+      } else if (addrModal.idx !== null) {
+        const target = addresses[addrModal.idx];
+        if (target?.id) {
+          const { data, error } = await dbUpdateAddress(target.id, {
+            label: f.label,
+            name: f.name.trim(),
+            phone: f.phone?.trim() || "",
+            line1: f.line1.trim(),
+            line2: f.line2 ? f.line2.trim() : null,
+            city: f.city.trim(),
+            state: f.state.trim(),
+            pincode: f.pincode.trim(),
+            is_default: f.isDefault,
+          }, user.id);
+
+          if (error && !data) {
+            throw new Error(error);
+          }
+          if (data) {
+            setDbAddresses((prev) =>
+              prev.map((a) => {
+                if (a.id === target.id) return data;
+                if (data.is_default) return { ...a, is_default: false };
+                return a;
+              })
+            );
+          }
+        }
+      }
+      closeAddrModal();
+    } catch (err: any) {
+      console.error("Failed to save address:", err);
+      setAddrError(err?.message || "Failed to save address to database. Please check your network.");
+    } finally {
+      setAddrSaving(false);
+    }
+  };
+
+  const deleteAddress = async (idx: number) => {
+    const target = addresses[idx];
+    if (target?.id) {
+      setDbAddresses((prev) => prev.filter((a) => a.id !== target.id));
+      await dbDeleteAddress(target.id, user.id);
+    }
+  };
+
+  const setDefaultAddr = async (idx: number) => {
+    const target = addresses[idx];
+    if (target?.id) {
+      setDbAddresses((prev) => prev.map((a) => ({ ...a, is_default: a.id === target.id })));
+      await dbSetDefaultAddress(target.id, user.id);
+    }
+  };
+
+  const setAddrField = (key: string, val: string | boolean) =>
+    setAddrModal((p) => ({ ...p, form: { ...p.form, [key]: val } }));
+
+  // ── Orders tab state ──
+  const [orderFilter, setOrderFilter] = useState("All");
+  const filteredOrders = orderFilter === "All" ? displayOrders : displayOrders.filter((o) => o.status === orderFilter);
+
+  // ── Security tab state ──
+  const [curPass, setCurPass]   = useState("");
+  const [newPass, setNewPass]   = useState("");
+  const [confPass, setConfPass] = useState("");
+  const [passMsg, setPassMsg]   = useState("");
+  const [notifs, setNotifs]     = useState({ orders: true, promos: false, reminders: true });
+
+  const [passSaving, setPassSaving] = useState(false);
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!curPass)                   { setPassMsg("Enter your current password."); return; }
+    if (newPass.length < 6)         { setPassMsg("New password must be at least 6 characters."); return; }
+    if (newPass !== confPass)       { setPassMsg("Passwords don't match."); return; }
+
+    setPassSaving(true);
+    // Re-verify the current password before changing it, since Supabase's
+    // updateUser() doesn't require the current password on its own.
+    const { error: verifyError } = await supabase.auth.signInWithPassword({
+      email: user.email,
+      password: curPass,
+    });
+    if (verifyError) {
+      setPassSaving(false);
+      setPassMsg("Current password is incorrect.");
+      return;
+    }
+
+    const { error } = await supabase.auth.updateUser({ password: newPass });
+    setPassSaving(false);
+    if (error) {
+      setPassMsg(error.message || "Failed to update password.");
+      return;
+    }
+    setPassMsg("✓ Password updated successfully!");
+    setCurPass(""); setNewPass(""); setConfPass("");
+    setTimeout(() => setPassMsg(""), 3000);
+  };
+
+  const NAV_ITEMS: { id: ProfileSection; label: string; badge?: number; icon: React.ReactElement }[] = [
+    { id: "profile",   label: "My Profile",       icon: <svg width="16" height="18" viewBox="0 0 16 18" fill="none"><path d="M8 9C10.21 9 12 7.21 12 5C12 2.79 10.21 1 8 1C5.79 1 4 2.79 4 5C4 7.21 5.79 9 8 9ZM8 11C5.33 11 0 12.34 0 15V17H16V15C16 12.34 10.67 11 8 11Z" fill="currentColor"/></svg> },
+    { id: "addresses", label: "Saved Addresses",  badge: addresses.length || undefined, icon: <svg width="16" height="20" viewBox="0 0 16 20" fill="none"><path d="M8 0C4.13 0 1 3.13 1 7C1 12.25 8 20 8 20C8 20 15 12.25 15 7C15 3.13 11.87 0 8 0ZM8 9.5C6.62 9.5 5.5 8.38 5.5 7C5.5 5.62 6.62 4.5 8 4.5C9.38 4.5 10.5 5.62 10.5 7C10.5 8.38 9.38 9.5 8 9.5Z" fill="currentColor"/></svg> },
+    { id: "orders",    label: "Order History",    badge: displayOrders.length || undefined, icon: <svg width="16" height="18" viewBox="0 0 16 18" fill="none"><path d="M3 0H13C14.1 0 15 0.9 15 2V16L12 14.5L8 16L4 14.5L1 16V2C1 0.9 1.9 0 3 0ZM4 5H12M4 8H12M4 11H8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" fill="none"/></svg> },
+    { id: "reviews",   label: "My Reviews",       badge: dbReviews.length || undefined, icon: <svg width="16" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg> },
+    { id: "lab-tests", label: "Lab Bookings",     badge: dbLabBookings.length || undefined, icon: <svg width="16" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"><path d="M9 3H6v6L2 15c-.83 1.39-.83 3.08 0 4.47C2.83 20.86 4.33 22 6 22h12c1.67 0 3.17-1.14 4-2.53.83-1.39.83-3.08 0-4.47L18 9V3h-3M9 3v6l-4 6h14L15 9V3M9 3h6"/></svg> },
+    { id: "security",  label: "Security",         icon: <svg width="16" height="18" viewBox="0 0 16 18" fill="none"><path d="M8 0L0 4V9C0 13.55 3.4 17.74 8 19C12.6 17.74 16 13.55 16 9V4L8 0ZM7 13L4 10L5.41 8.59L7 10.17L10.59 6.58L12 8L7 13Z" fill="currentColor"/></svg> },
+  ];
+
+  return (
+    <div className="min-h-screen bg-[#f8fafc]">
+      {/* ── Header ── */}
+      <div
+        className="relative overflow-hidden"
+        style={{ background: user.role === "retailer" ? "linear-gradient(140deg, #1e1b4b 0%, #0f172a 50%, #ff3366 100%)" : "linear-gradient(140deg, #073b4c 0%, #0a5568 55%, " + accent + " 100%)" }}
+      >
+        <div className="absolute -top-20 -right-20 w-72 h-72 rounded-full opacity-[0.06]" style={{ backgroundColor: "white" }} />
+        <div className="absolute top-6 -left-28 w-56 h-56 rounded-full opacity-[0.04]" style={{ backgroundColor: "white" }} />
+        <div className="absolute -bottom-10 right-40 w-40 h-40 rounded-full opacity-[0.05]" style={{ backgroundColor: "white" }} />
+
+        <div className="max-w-[1280px] mx-auto px-4 sm:px-6 lg:px-10 py-6 sm:py-8 relative z-10">
+          <button
+            onClick={() => onNavigate("home")}
+            className="flex items-center gap-2 text-white/65 hover:text-white text-xs sm:text-sm mb-4 sm:mb-6 transition-colors"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M10 3L5 8L10 13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            Back to Home
+          </button>
+
+          <div className="flex flex-col sm:flex-row items-start sm:items-end gap-4 sm:gap-6">
+            {/* Avatar with Camera Button & Device Upload */}
+            <div className="relative shrink-0">
+              <div
+                onClick={() => !uploadingPhoto && imageRef.current?.click()}
+                className="w-20 h-20 sm:w-24 sm:h-24 rounded-2xl border-4 border-white/20 overflow-hidden cursor-pointer group relative shadow-md"
+                style={{ backgroundColor: accent }}
+                title="Click to upload profile picture from your device"
+              >
+                {(avatarPreview || user.profileImage) ? (
+                  <img src={avatarPreview || user.profileImage} alt={user.name} className="w-full h-full object-cover" />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center font-['Manrope',sans-serif] font-extrabold text-white text-2xl sm:text-3xl">
+                    {(user?.name?.[0] || user?.email?.[0] || "U").toUpperCase()}
+                  </div>
+                )}
+                {uploadingPhoto ? (
+                  <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center gap-1">
+                    <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    <span className="text-[9px] text-white font-bold tracking-tight">Saving…</span>
+                  </div>
+                ) : (
+                  <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center gap-1">
+                    <svg width="20" height="18" viewBox="0 0 20 18" fill="white"><path d="M7 1H13L14.5 3H19C19.55 3 20 3.45 20 4V16C20 16.55 19.55 17 19 17H1C0.45 17 0 16.55 0 16V4C0 3.45 0.45 3 1 3H5.5L7 1Z"/><circle cx="10" cy="10" r="3" fill="rgba(0,0,0,0.35)" stroke="white" strokeWidth="1.5"/></svg>
+                    <span className="text-[9px] text-white font-bold">Upload</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Explicit camera pill button for desktop & mobile device upload */}
+              <button
+                type="button"
+                onClick={() => !uploadingPhoto && imageRef.current?.click()}
+                disabled={uploadingPhoto}
+                className="absolute -bottom-1 -right-1 w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-white text-slate-800 shadow-md flex items-center justify-center cursor-pointer border-2 border-slate-100 hover:scale-110 active:scale-95 transition-all z-10"
+                title="Upload profile picture from device"
+              >
+                {uploadingPhoto ? (
+                  <div className="w-3.5 h-3.5 border-2 border-slate-300 border-t-rose-600 rounded-full animate-spin" />
+                ) : (
+                  <svg width="14" height="13" viewBox="0 0 20 18" fill={accent}>
+                    <path d="M7 1H13L14.5 3H19C19.55 3 20 3.45 20 4V16C20 16.55 19.55 17 19 17H1C0.45 17 0 16.55 0 16V4C0 3.45 0.45 3 1 3H5.5L7 1Z"/>
+                    <circle cx="10" cy="10" r="3" fill="white"/>
+                  </svg>
+                )}
+              </button>
+
+              <input ref={imageRef} type="file" accept="image/*" className="hidden" onChange={handleProfileImage} />
+            </div>
+
+            {/* Name + meta */}
+            <div className="flex-1 pb-1">
+              <div className="flex items-center gap-2.5 sm:gap-3 mb-1 flex-wrap">
+                <h1 className="font-['Manrope',sans-serif] font-extrabold text-white text-xl sm:text-2xl leading-none">{user.name}</h1>
+                <span className="text-[10px] font-bold uppercase tracking-wider px-2.5 py-0.5 rounded-full capitalize" style={{ backgroundColor: "rgba(255,255,255,0.18)", color: "rgba(255,255,255,0.95)" }}>
+                  {user.role}
+                </span>
+              </div>
+              <p className="text-white/70 text-xs sm:text-sm mt-0.5">{user.email}</p>
+              {user.phone && <p className="text-white/50 text-xs mt-0.5">{user.phone}</p>}
+              {user.shopName && (
+                <p className="text-white/80 text-xs sm:text-sm mt-1 font-medium flex items-center gap-1.5">
+                  <svg width="13" height="12" viewBox="0 0 13 12" fill="white" opacity="0.8"><path d="M1 6H2.5V11H10.5V6H12L11 2H2L1 6ZM4 6V10H2.5V6H4ZM9 6V10H7.5V7H5.5V10H4V6H9Z"/></svg>
+                  {user.shopName}
+                </p>
+              )}
+              {photoMsg && (
+                <div className="mt-2 text-xs font-semibold px-3 py-1 rounded-full bg-white/20 backdrop-blur-md text-white inline-flex items-center gap-1.5 animate-in fade-in">
+                  <span>{uploadingPhoto ? "⏳" : "✓"}</span>
+                  <span>{photoMsg}</span>
+                </div>
+              )}
+              {!photoMsg && user.joinedDate && (
+                <p className="text-white/40 text-[11px] mt-1">Member since {user.joinedDate}</p>
+              )}
+            </div>
+
+            {/* Quick stats */}
+            <div className="grid grid-cols-2 sm:flex items-center gap-2 sm:gap-3 pb-1 w-full sm:w-auto">
+              {[
+                { label: "Total Orders",   value: displayOrders.length },
+                { label: "Delivered",      value: displayOrders.filter((o) => o.status === "Delivered").length },
+                { label: "Addresses",      value: addresses.length },
+                { label: "Total Spent",    value: "₹" + totalSpent.toLocaleString() },
+              ].map((s) => (
+                <div key={s.label} className="text-center px-3 sm:px-4 py-2 sm:py-2.5 rounded-xl min-w-[70px]" style={{ backgroundColor: "rgba(255,255,255,0.1)" }}>
+                  <p className="font-['Manrope',sans-serif] font-extrabold text-white text-base sm:text-xl leading-none">{s.value}</p>
+                  <p className="text-white/50 text-[10px] mt-1">{s.label}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Body ── */}
+      <div className="max-w-[1280px] mx-auto px-4 sm:px-6 lg:px-10 py-6 sm:py-8 flex flex-col md:flex-row gap-5 sm:gap-7">
+        {/* Sidebar Tabs */}
+        <aside className="w-full md:w-56 shrink-0">
+          <div className="bg-white rounded-2xl border border-[#e2e8f0] overflow-hidden flex md:flex-col overflow-x-auto md:overflow-visible sticky top-20">
+            {NAV_ITEMS.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => setSection(item.id)}
+                className="flex items-center gap-2 sm:gap-3 px-3.5 sm:px-4 py-3 sm:py-3.5 text-xs sm:text-sm font-semibold transition-all border-b md:border-b border-r md:border-r-0 border-[#f1f5f9] last:border-0 shrink-0 md:w-full"
+                style={section === item.id
+                  ? { color: accent, backgroundColor: accent + "0f" }
+                  : { color: "#6d7a6f" }
+                }
+              >
+                <span style={{ color: section === item.id ? accent : "#c0ccc0" }}>{item.icon}</span>
+                <span className="text-left whitespace-nowrap">{item.label}</span>
+                {item.badge !== undefined && item.badge > 0 && (
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full ml-auto" style={{ backgroundColor: section === item.id ? accent + "20" : "#f1f5f9", color: section === item.id ? accent : "#9aa89b" }}>
+                    {item.badge}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        </aside>
+
+        {/* Content */}
+        <div className="flex-1 min-w-0">
+
+          {/* ════ MY PROFILE ════ */}
+          {section === "profile" && (
+            <div className="bg-white rounded-2xl border border-[#e2e8f0] p-5 sm:p-7">
+              <div className="flex items-center justify-between mb-5 sm:mb-6">
+                <h2 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-lg sm:text-xl">My Profile</h2>
+                {saved && (
+                  <span className="flex items-center gap-1.5 text-[#047857] text-xs sm:text-sm font-semibold bg-[#d1fae5] px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-full animate-pulse">
+                    <svg width="12" height="10" viewBox="0 0 12 10" fill="none"><path d="M1 5L4.5 8.5L11 1" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/></svg>
+                    Saved!
+                  </span>
+                )}
+              </div>
+
+              {/* Avatar row */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 sm:pb-7 mb-5 sm:mb-7 border-b border-slate-200/70 bg-slate-50/70 p-4 sm:p-5 rounded-2xl border border-slate-100">
+                <div className="flex items-center gap-4">
+                  <div
+                    onClick={() => !uploadingPhoto && imageRef.current?.click()}
+                    className="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl overflow-hidden cursor-pointer group relative shrink-0 border-2 border-white shadow-xs"
+                    style={{ backgroundColor: accent }}
+                    title="Upload profile picture from device"
+                  >
+                    {(avatarPreview || user.profileImage) ? (
+                      <img src={avatarPreview || user.profileImage} alt={user.name} className="w-full h-full object-cover" />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center font-['Manrope',sans-serif] font-extrabold text-white text-xl sm:text-2xl">
+                        {(user?.name?.[0] || user?.email?.[0] || "U").toUpperCase()}
+                      </div>
+                    )}
+                    {uploadingPhoto ? (
+                      <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
+                        <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      </div>
+                    ) : (
+                      <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                        <svg width="18" height="16" viewBox="0 0 20 18" fill="white"><path d="M7 1H13L14.5 3H19C19.55 3 20 3.45 20 4V16C20 16.55 19.55 17 19 17H1C0.45 17 0 16.55 0 16V4C0 3.45 0.45 3 1 3H5.5L7 1Z"/><circle cx="10" cy="10" r="2.8" fill="rgba(0,0,0,0.4)" stroke="white" strokeWidth="1.5"/></svg>
+                      </div>
+                    )}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <p className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-base sm:text-lg leading-none">{user.name}</p>
+                      <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full" style={{ backgroundColor: accent + "18", color: accent, border: `1px solid ${accent}35` }}>
+                        {user.role}
+                      </span>
+                    </div>
+                    <p className="text-slate-500 text-xs mt-1 font-mono">{user.email}</p>
+                    <p className="text-[11px] font-medium mt-1" style={{ color: accent }}>
+                      ✓ Profile picture is saved to database & visible in Admin Dashboard
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => !uploadingPhoto && imageRef.current?.click()}
+                  disabled={uploadingPhoto}
+                  className="self-start sm:self-center px-4 py-2.5 rounded-xl bg-white border border-slate-200 hover:border-[#ff3366] hover:bg-rose-50/50 text-slate-800 font-bold text-xs shadow-2xs transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <span>📷</span>
+                  <span>{uploadingPhoto ? "Saving to Database…" : (avatarPreview || user.profileImage) ? "Change Picture" : "Upload Picture"}</span>
+                </button>
+              </div>
+
+              {/* Form */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-1.5">Full Name</label>
+                  <input type="text" value={editName} onChange={(e) => setEditName(e.target.value)} className={INPUT_CLS}
+                    onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = "#e2e8f0")} />
+                </div>
+                <div>
+                  <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-1.5">Email Address</label>
+                  <input type="email" value={user.email} disabled className={`${INPUT_CLS} opacity-60 cursor-not-allowed`} />
+                </div>
+                <div>
+                  <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-1.5">Phone Number</label>
+                  <input type="tel" value={editPhone} onChange={(e) => setEditPhone(e.target.value.replace(/[^0-9+]/g, ""))} placeholder="9876543210 (10-digit number)" className={INPUT_CLS}
+                    onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = "#e2e8f0")} />
+                </div>
+                {user.role === "retailer" && (
+                  <div>
+                    <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-1.5">Shop / Business Name</label>
+                    <input type="text" value={editShop} onChange={(e) => setEditShop(e.target.value)} className={INPUT_CLS}
+                      onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = "#e2e8f0")} />
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-6 pt-5 border-t border-[#f1f5f9] flex flex-col sm:flex-row items-center justify-between gap-3">
+                {profileMsg ? (
+                  <p className={`text-xs font-semibold ${saved ? "text-green-600" : "text-red-500"}`}>
+                    {profileMsg}
+                  </p>
+                ) : <span />}
+                <button
+                  type="button"
+                  onClick={handleSaveProfile}
+                  disabled={savingProfile}
+                  className="w-full sm:w-auto px-6 py-2.5 rounded-xl text-white text-xs sm:text-sm font-bold hover:opacity-90 transition-opacity disabled:opacity-50 flex items-center justify-center gap-2"
+                  style={{ backgroundColor: accent }}
+                >
+                  {savingProfile ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      <span>Saving to Database…</span>
+                    </>
+                  ) : (
+                    "Save Changes"
+                  )}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ════ ADDRESSES ════ */}
+          {section === "addresses" && (
+            <div>
+              <div className="flex items-center justify-between mb-5 sm:mb-6">
+                <div>
+                  <h2 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-lg sm:text-xl">Saved Addresses</h2>
+                  <p className="text-[#9aa89b] text-xs sm:text-sm mt-0.5">Manage your delivery and billing addresses</p>
+                </div>
+                <button
+                  onClick={openAddAddr}
+                  className="flex items-center gap-1.5 px-3.5 sm:px-4 py-2 rounded-xl text-white text-xs sm:text-sm font-bold hover:opacity-90 transition-opacity"
+                  style={{ backgroundColor: accent }}
+                >
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 1V11M1 6H11" stroke="white" strokeWidth="2" strokeLinecap="round"/></svg>
+                  Add Address
+                </button>
+              </div>
+
+              {addresses.length === 0 ? (
+                <div className="bg-white rounded-2xl border border-[#e2e8f0] py-16 sm:py-20 flex flex-col items-center gap-4 px-4 text-center">
+                  <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl flex items-center justify-center" style={{ backgroundColor: accent + "15" }}>
+                    <svg width="28" height="34" viewBox="0 0 28 34" fill="none"><path d="M14 1C7.37 1 2 6.37 2 13C2 22.25 14 33 14 33C14 33 26 22.25 26 13C26 6.37 20.63 1 14 1ZM14 17.5C11.51 17.5 9.5 15.49 9.5 13C9.5 10.51 11.51 8.5 14 8.5C16.49 8.5 18.5 10.51 18.5 13C18.5 15.49 16.49 17.5 14 17.5Z" fill={accent} fillOpacity="0.35"/></svg>
+                  </div>
+                  <div>
+                    <p className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-base sm:text-lg">No saved addresses yet</p>
+                    <p className="text-[#9aa89b] text-xs sm:text-sm mt-1">Add a delivery address for faster checkout</p>
+                  </div>
+                  <button onClick={openAddAddr} className="px-6 py-2.5 rounded-xl text-white text-xs sm:text-sm font-bold hover:opacity-90 transition-opacity" style={{ backgroundColor: accent }}>
+                    Add Your First Address
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {addresses.map((addr, idx) => {
+                    const lc = ADDR_LABEL_COLORS[addr.label] ?? ADDR_LABEL_COLORS["Other"];
+                    return (
+                      <div key={addr.id} className="bg-white rounded-2xl border-2 p-4 sm:p-5 transition-all" style={{ borderColor: addr.isDefault ? accent : "#e2e8f0" }}>
+                        <div className="flex items-start justify-between mb-3">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-bold px-2.5 py-0.5 rounded-full" style={{ color: lc.color, backgroundColor: lc.bg }}>{addr.label}</span>
+                            {addr.isDefault && (
+                              <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-[#d1fae5] text-[#047857] uppercase tracking-wide">Default</span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button onClick={() => openEditAddr(idx)} className="w-7 h-7 rounded-lg bg-[#e0f2fe] text-[#0369a1] flex items-center justify-center hover:opacity-80 transition-opacity" title="Edit">
+                              <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M7.5 1.5L10.5 4.5M1 11L2 9L9 1.5L12 4.5L5 12H1V12Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/></svg>
+                            </button>
+                            <button onClick={() => deleteAddress(idx)} className="w-7 h-7 rounded-lg bg-[#fee2e2] text-[#b91c1c] flex items-center justify-center hover:opacity-80 transition-opacity" title="Delete">
+                              <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 3H10M4 3V2H8V3M5 5.5V9M7 5.5V9M3 3L3.5 10H8.5L9 3H3Z" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                            </button>
+                          </div>
+                        </div>
+                        <p className="font-semibold text-[#073b4c] text-sm">{addr.name}</p>
+                        <p className="text-[#6d7a6f] text-xs sm:text-sm mt-0.5 leading-snug">{addr.line1}{addr.line2 ? `, ${addr.line2}` : ""}</p>
+                        <p className="text-[#6d7a6f] text-xs sm:text-sm leading-snug">{addr.city}, {addr.state} – {addr.pincode}</p>
+                        {addr.phone && <p className="text-[#9aa89b] text-xs mt-1">{addr.phone}</p>}
+                        {addr.isDefault ? (
+                          <p className="mt-3 text-xs text-[#047857] font-medium flex items-center gap-1.5">
+                            <svg width="11" height="9" viewBox="0 0 11 9" fill="none"><path d="M1 4.5L4 7.5L10 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+                            Auto-fills at checkout
+                          </p>
+                        ) : (
+                          <button onClick={() => setDefaultAddr(idx)} className="mt-3 text-xs font-semibold hover:underline transition-colors" style={{ color: accent }}>
+                            Set as default
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ════ ORDER HISTORY ════ */}
+          {section === "orders" && (
+            <div className="flex flex-col gap-5">
+              <div className="flex items-start justify-between gap-4 flex-wrap">
+                <div>
+                  <h2 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-xl">Order History</h2>
+                  <p className="text-[#9aa89b] text-sm mt-0.5">
+                    {displayOrders.length} orders · ₹{totalSpent.toLocaleString()} total spent
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
+                  {["All", "Processing", "Shipped", "Delivered", "Cancelled"].map((f) => (
+                    <button key={f} onClick={() => setOrderFilter(f)}
+                      className="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all whitespace-nowrap shrink-0"
+                      style={orderFilter === f
+                        ? { backgroundColor: accent, color: "white" }
+                        : { backgroundColor: "white", color: "#6d7a6f", border: "1px solid #e2e8f0" }}>
+                      {f}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {filteredOrders.length === 0 ? (
+                <div className="bg-white rounded-2xl border border-[#e2e8f0] py-12 text-center">
+                  <p className="text-[#9aa89b] text-sm">No orders with this status.</p>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-3">
+                  {filteredOrders.map((o) => {
+                    const st = orderStatusStyle(o.status);
+                    return (
+                      <div key={o.id} className="bg-white rounded-2xl border border-[#e2e8f0] p-5 hover:shadow-sm transition-shadow">
+                        <div className="flex flex-col sm:flex-row items-start justify-between gap-4">
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2.5 mb-2 flex-wrap">
+                              <span className="font-mono text-sm font-bold" style={{ color: accent }}>{o.id}</span>
+                              <span className="text-[10px] font-bold px-2.5 py-1 rounded-full" style={{ color: st.color, backgroundColor: st.bg }}>{o.status}</span>
+                              <span className="text-[#9aa89b] text-xs">{o.date}</span>
+
+                              {/* Delivery Partner Strip (only when assigned) */}
+                              {(o as any).deliveryPartnerId && (
+                                <div className="inline-flex items-center gap-2 rounded-full px-2.5 py-0.5 text-xs font-semibold" style={{ backgroundColor: accent + "12", border: `1px solid ${accent}25`, color: accent }}>
+                                  <span className="text-[11px]">🛵</span>
+                                  <span>
+                                    {(o as any).deliveryStatus === "picked_up"
+                                      ? "Picked up by"
+                                      : "Assigned to"}{" "}
+                                    <strong className="font-bold text-[#073b4c]">
+                                      {(o as any).deliveryPartnerName || "Delivery Partner"}
+                                    </strong>
+                                  </span>
+                                  {(o as any).deliveryPartnerPhone ? (
+                                    <a
+                                      href={`tel:${(o as any).deliveryPartnerPhone}`}
+                                      className="w-6 h-6 rounded-full text-white flex items-center justify-center transition-all cursor-pointer active:scale-90 shadow-2xs"
+                                      style={{ backgroundColor: accent }}
+                                      title={`Call ${(o as any).deliveryPartnerName || "Partner"} (${(o as any).deliveryPartnerPhone})`}
+                                    >
+                                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                        <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z" />
+                                      </svg>
+                                    </a>
+                                  ) : null}
+                                </div>
+                              )}
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 mb-3">
+                              {o.items.map((item) => (
+                                <div key={item} className="flex items-center gap-1.5 bg-[#f8fafb] border border-[#e2e8f0] px-2.5 py-1 rounded-lg">
+                                  <span className="text-xs text-[#073b4c] font-medium">{item}</span>
+                                  {o.status === "Delivered" && (
+                                    <button
+                                      onClick={() =>
+                                        setReviewModal({
+                                          open: true,
+                                          productName: item.replace(/×\d+/g, "").trim(),
+                                          rating: 5,
+                                          title: "",
+                                          comment: "",
+                                          submitting: false,
+                                        })
+                                      }
+                                      className="text-[10px] font-bold px-1.5 py-0.5 rounded transition-colors"
+                                      style={{ color: accent, backgroundColor: accent + "18" }}
+                                      title="Review this product"
+                                    >
+                                      ★ Review
+                                    </button>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+
+                            {/* Tracking & Invoice Actions */}
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <button
+                                onClick={() => onTrackOrder?.(o.id)}
+                                className="flex items-center gap-1.5 text-white text-xs font-bold px-3.5 py-1.5 rounded-xl transition-all shadow-2xs cursor-pointer active:scale-95"
+                                style={{ backgroundColor: accent }}
+                              >
+                                <span>🚚</span>
+                                <span>Track Live Status</span>
+                              </button>
+
+                              <button
+                                onClick={() => {
+                                  const orderIndex = displayOrders.findIndex((item) => item.id === o.id || (item as any).dbId === o.id);
+                                  const resolvedInvoiceNumber = (o as any).invoiceNumber || `INV-${String(orderIndex >= 0 ? orderIndex + 1 : 1).padStart(3, "0")}`;
+                                  const dbOrder = dbOrders.find((db) => db.order_number === o.id || db.id === o.id);
+                                  if (dbOrder) {
+                                    printOrDownloadInvoice({
+                                      id: dbOrder.order_number,
+                                      dbId: dbOrder.id,
+                                      invoiceNumber: dbOrder.invoice_number || resolvedInvoiceNumber,
+                                      createdAt: dbOrder.created_at,
+                                      customer: dbOrder.customer_name || user.name,
+                                      phone: dbOrder.customer_phone || user.phone || "+91 98765 00000",
+                                      role: dbOrder.user_role === "retailer" ? "retailer" : "customer",
+                                      shopName: dbOrder.shop_name || (user.role === "retailer" ? user.shopName : undefined),
+                                      address: formatOrderAddress(dbOrder.shipping_address),
+                                      items: dbOrder.order_items?.length || 0,
+                                      amount: Number(dbOrder.total_amount),
+                                      status: dbOrder.status,
+                                      date: dbOrder.created_at,
+                                      payment: dbOrder.payment_method || "UPI",
+                                      paymentStatus: dbOrder.payment_status || "Paid",
+                                      orderItems: (dbOrder.order_items || []).map((item) => ({
+                                        name: item.product_name,
+                                        quantity: item.quantity,
+                                        price: Number(item.unit_price),
+                                        totalPrice: Number(item.total_price) || (Number(item.unit_price) * Number(item.quantity)),
+                                        mrp: item.mrp == null ? Number(item.unit_price) : Number(item.mrp),
+                                        batch: item.batch_no || undefined,
+                                        expiry: item.expiry_date || undefined,
+                                        sku: item.sku || undefined,
+                                      })),
+                                    });
+                                  } else {
+                                    // Fallback for sample/demo orders in profile history with distinct invoice ID
+                                    printOrDownloadInvoice({
+                                      id: o.id,
+                                      invoiceNumber: resolvedInvoiceNumber,
+                                      customer: user.name,
+                                      phone: user.phone || "+91 98765 00000",
+                                      role: user.role === "retailer" ? "retailer" : "customer",
+                                      shopName: user.shopName,
+                                      address: addresses[0] ? `${addresses[0].line1}, ${addresses[0].city}, ${addresses[0].state} - ${addresses[0].pincode}` : "Registered Delivery Address",
+                                      items: o.items.length,
+                                      amount: o.total,
+                                      status: o.status,
+                                      date: o.date,
+                                      payment: "UPI",
+                                      paymentStatus: "Paid",
+                                      orderItems: o.items.map((itStr) => {
+                                        const match = itStr.match(/^(.*)\s+×(\d+)$/);
+                                        const name = match ? match[1].trim() : itStr;
+                                        const qty = match ? Number(match[2]) : 1;
+                                        const price = Math.round(o.total / Math.max(1, o.items.length) / qty);
+                                        return {
+                                          name,
+                                          quantity: qty,
+                                          price,
+                                          totalPrice: price * qty,
+                                          mrp: Math.round(price * 1.15),
+                                        };
+                                      }),
+                                    });
+                                  }
+                                }}
+                                className="flex items-center gap-1 bg-slate-50 hover:bg-slate-100 text-slate-700 text-xs font-bold px-3 py-1.5 rounded-xl transition-all border border-slate-200 cursor-pointer"
+                                title="Download / Print Invoice Bill PDF"
+                              >
+                                <span>🧾</span>
+                                <span>Invoice PDF</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="text-left sm:text-right shrink-0">
+                            <p className="font-['Manrope',sans-serif] font-extrabold text-[#073b4c] text-xl">₹{o.total.toLocaleString()}</p>
+                            <span className="inline-block text-[11px] text-[#9aa89b] mt-1">Verified Order</span>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ════ MY REVIEWS ════ */}
+          {section === "reviews" && (
+            <div className="flex flex-col gap-5">
+              <div className="flex items-start justify-between gap-4 flex-wrap">
+                <div>
+                  <h2 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-xl">My Reviews & Ratings</h2>
+                  <p className="text-[#9aa89b] text-sm mt-0.5">
+                    {dbReviews.length} product review{dbReviews.length !== 1 ? "s" : ""} written by you as a {user.role === "retailer" ? "Wholesale Retailer" : "Verified Customer"}
+                  </p>
+                </div>
+                <button
+                  onClick={() =>
+                    setReviewModal({
+                      open: true,
+                      productName: "Dettol Antiseptic Liquid 250ml",
+                      rating: 5,
+                      title: "",
+                      comment: "",
+                      submitting: false,
+                    })
+                  }
+                  className="px-4 py-2 rounded-xl text-white text-xs sm:text-sm font-bold hover:opacity-90 transition-opacity flex items-center gap-1.5"
+                  style={{ backgroundColor: accent }}
+                >
+                  <span>+ Write a Review</span>
+                </button>
+              </div>
+
+              {dbReviews.length === 0 ? (
+                <div className="bg-white rounded-2xl border border-slate-200 py-16 flex flex-col items-center gap-3 text-center px-4">
+                  <div className="w-14 h-14 rounded-2xl flex items-center justify-center" style={{ backgroundColor: accent + "15", color: accent }}>
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+                      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+                    </svg>
+                  </div>
+                  <p className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-lg">No Reviews Written Yet</p>
+                  <p className="text-[#9aa89b] text-xs sm:text-sm max-w-sm">
+                    {user.role === "retailer"
+                      ? "Share wholesale product reviews, batch shelf life observations, and profit margins to help other chemist retailers."
+                      : "Help other customers make informed decisions by reviewing products you've ordered."}
+                  </p>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-3">
+                  {dbReviews.map((rev) => (
+                    <div key={rev.id} className="bg-white rounded-2xl border border-[#e2e8f0] p-5 shadow-xs flex flex-col gap-2.5">
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-bold text-[#073b4c] text-sm">
+                              {rev.title || "Product Review"}
+                            </span>
+                            {rev.user_role === "retailer" ? (
+                              <span className="text-[9px] font-extrabold bg-[#dbeafe] text-[#1d4ed8] px-2 py-0.5 rounded-full uppercase">
+                                📦 Wholesale Retailer
+                              </span>
+                            ) : (
+                              <span className="text-[9px] font-bold bg-[#d1fae5] text-[#047857] px-2 py-0.5 rounded-full">
+                                ✓ Verified Customer
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2 mt-1">
+                            <StarRow rating={rev.rating} size={12} />
+                            <span className="text-[#9aa89b] text-[11px]">
+                              {new Date(rev.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
+                            </span>
+                          </div>
+                        </div>
+                        <span className="text-xs text-[#6d7a6f] bg-[#f8fafb] border border-[#e2e8f0] px-2.5 py-1 rounded-lg">
+                          👍 {rev.helpful_count} helpful
+                        </span>
+                      </div>
+                      <p className="text-[#3e4a3f] text-xs sm:text-sm leading-relaxed">{rev.comment}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ════ LAB BOOKINGS ════ */}
+          {section === "lab-tests" && (
+            <div className="flex flex-col gap-5">
+              <div className="flex items-start justify-between gap-4 flex-wrap">
+                <div>
+                  <h2 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-xl">Lab Test Bookings</h2>
+                  <p className="text-[#9aa89b] text-sm mt-0.5">
+                    {dbLabBookings.length} scheduled / past home collection{dbLabBookings.length !== 1 ? "s" : ""}
+                  </p>
+                </div>
+                <button
+                  onClick={() => onNavigate("lab-tests")}
+                  className="px-4 py-2 rounded-xl text-white text-xs sm:text-sm font-bold hover:opacity-90 transition-opacity"
+                  style={{ backgroundColor: accent }}
+                >
+                  + Book New Test
+                </button>
+              </div>
+
+              {dbLabBookings.length === 0 ? (
+                <div className="bg-white rounded-2xl border border-slate-200 py-16 flex flex-col items-center gap-3 text-center px-4">
+                  <div className="w-14 h-14 rounded-2xl flex items-center justify-center" style={{ backgroundColor: accent + "15", color: accent }}>
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M9 3H6v6L2 15c-.83 1.39-.83 3.08 0 4.47C2.83 20.86 4.33 22 6 22h12c1.67 0 3.17-1.14 4-2.53.83-1.39.83-3.08 0-4.47L18 9V3h-3M9 3v6l-4 6h14L15 9V3M9 3h6"/></svg>
+                  </div>
+                  <p className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-lg">No Lab Test Bookings Yet</p>
+                  <p className="text-[#9aa89b] text-xs sm:text-sm max-w-sm">
+                    Book certified pathology tests from home with free sample pickup and 24-hour smart digital reports.
+                  </p>
+                  <button
+                    onClick={() => onNavigate("lab-tests")}
+                    className="mt-2 px-5 py-2.5 rounded-xl text-white text-xs sm:text-sm font-bold hover:opacity-90 transition-opacity"
+                    style={{ backgroundColor: accent }}
+                  >
+                    Browse Health Packages
+                  </button>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-3">
+                  {dbLabBookings.map((b) => {
+                    const isCompleted = b.status === "Completed" || b.status === "Report Generated";
+                    return (
+                      <div key={b.id} className="bg-white rounded-2xl border border-[#e2e8f0] p-5 hover:shadow-xs transition-shadow">
+                        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2.5 mb-2 flex-wrap">
+                              <span className="font-mono text-sm font-bold" style={{ color: accent }}>{b.booking_number}</span>
+                              <span className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full uppercase tracking-wider ${
+                                b.status === "Scheduled" ? "bg-[#fef3c7] text-[#b45309]" :
+                                b.status === "Sample Collected" ? "bg-[#e0f2fe] text-[#0369a1]" :
+                                b.status === "Report Generated" || b.status === "Completed" ? "bg-[#d1fae5] text-[#047857]" :
+                                "bg-[#fee2e2] text-[#b91c1c]"
+                              }`}>
+                                {b.status}
+                              </span>
+                              <span className="text-[#9aa89b] text-xs">
+                                Booked on {new Date(b.created_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}
+                              </span>
+                            </div>
+
+                            <h3 className="font-bold text-[#073b4c] text-base">{b.package_name}</h3>
+                            <p className="text-[#6d7a6f] text-xs mt-1">
+                              <strong>Patient:</strong> {b.patient_name} ({b.patient_age} yrs, {b.patient_gender}) · 📞 {b.patient_phone}
+                            </p>
+                            <p className="text-[#6d7a6f] text-xs mt-0.5">
+                              <strong>Sample Collection:</strong> 🗓️ {b.collection_date} ({b.collection_time_slot})
+                            </p>
+                            <p className="text-[#9aa89b] text-[11px] mt-0.5">
+                              📍 {b.collection_address?.line1 || "Address"}, {b.collection_address?.city || ""} {b.collection_address?.pincode ? `- ${b.collection_address.pincode}` : ""}
+                            </p>
+                          </div>
+
+                          <div className="text-left sm:text-right shrink-0 border-t sm:border-t-0 pt-3 sm:pt-0 border-[#f1f5f9]">
+                            <p className="font-['Manrope',sans-serif] font-extrabold text-[#073b4c] text-xl">₹{Number(b.total_amount).toLocaleString()}</p>
+                            <span className="inline-block text-[10px] text-[#6d7a6f] font-semibold bg-[#f1f5f9] px-2 py-0.5 rounded-md mt-1">
+                              {b.payment_method}
+                            </span>
+                            {isCompleted && (
+                              <button className="block w-full sm:w-auto text-xs font-bold mt-2 underline" style={{ color: accent }}>
+                                📥 Download Report
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ════ SECURITY ════ */}
+          {section === "security" && (
+            <div className="flex flex-col gap-5 max-w-lg">
+              {/* Change Password */}
+              <div className="bg-white rounded-2xl border border-[#e2e8f0] p-5 sm:p-7">
+                <h2 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-xl mb-5">Change Password</h2>
+                <form onSubmit={handleChangePassword} className="flex flex-col gap-4">
+                  {[
+                    { label: "Current Password",    val: curPass,  set: setCurPass },
+                    { label: "New Password",         val: newPass,  set: setNewPass },
+                    { label: "Confirm New Password", val: confPass, set: setConfPass },
+                  ].map(({ label, val, set }) => (
+                    <div key={label}>
+                      <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-1.5">{label}</label>
+                      <input type="password" value={val} onChange={(e) => set(e.target.value)} placeholder="••••••••" className={INPUT_CLS}
+                        onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = "#e2e8f0")} />
+                    </div>
+                  ))}
+                  {passMsg && (
+                    <p className={`text-sm font-medium ${passMsg.startsWith("✓") ? "text-[#047857]" : "text-[#c0392b]"}`}>{passMsg}</p>
+                  )}
+                  <button type="submit" className="w-full sm:w-auto self-start px-6 py-2.5 rounded-xl text-white text-sm font-bold hover:opacity-90 transition-opacity" style={{ backgroundColor: accent }}>
+                    Update Password
+                  </button>
+                </form>
+              </div>
+
+              {/* Notifications */}
+              <div className="bg-white rounded-2xl border border-[#e2e8f0] p-5 sm:p-7">
+                <h3 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-base mb-5">Notification Preferences</h3>
+                <div className="flex flex-col gap-5">
+                  {[
+                    { key: "orders" as const,     label: "Order updates via Email",   sub: "Delivery status, confirmations" },
+                    { key: "promos" as const,      label: "Offers & promotions via SMS", sub: "Exclusive deals and discounts" },
+                    { key: "reminders" as const,   label: "Reorder reminders",         sub: "When your medicines are about to run out" },
+                  ].map(({ key, label, sub }) => (
+                    <div key={key} className="flex items-start justify-between gap-4">
+                      <div>
+                        <p className="text-[#073b4c] text-sm font-medium">{label}</p>
+                        <p className="text-[#9aa89b] text-xs mt-0.5">{sub}</p>
+                      </div>
+                      <button
+                        onClick={() => setNotifs((p) => ({ ...p, [key]: !p[key] }))}
+                        className="w-10 h-6 rounded-full relative transition-colors duration-200 shrink-0 mt-0.5"
+                        style={{ backgroundColor: notifs[key] ? accent : "#d1d5db" }}
+                      >
+                        <div className="absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-all duration-200" style={{ left: notifs[key] ? "22px" : "4px" }} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Danger Zone */}
+              <div className="bg-white rounded-2xl border-2 border-[#fee2e2] p-5 sm:p-7">
+                <h3 className="font-['Manrope',sans-serif] font-bold text-[#b91c1c] text-base mb-1">Danger Zone</h3>
+                <p className="text-[#6d7a6f] text-sm mb-4">Permanently delete your account and all associated data. This cannot be undone.</p>
+                <button className="px-5 py-2 rounded-xl border-2 border-[#b91c1c] text-[#b91c1c] text-sm font-bold hover:bg-[#fee2e2] transition-colors">
+                  Delete Account
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Address Modal ── */}
+      {addrModal.open && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 overflow-y-auto" onClick={closeAddrModal}>
+          <div className="bg-white rounded-2xl w-full max-w-[500px] shadow-2xl my-4" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 sm:px-7 py-4 sm:py-5 border-b border-[#e2e8f0]">
+              <h3 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-base sm:text-lg">
+                {addrModal.mode === "add" ? "Add New Address" : "Edit Address"}
+              </h3>
+              <button onClick={closeAddrModal} className="w-8 h-8 rounded-full bg-[#f1f5f9] flex items-center justify-center hover:bg-[#e2e8f0] transition-colors">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M1 1L11 11M11 1L1 11" stroke="#073b4c" strokeWidth="1.5" strokeLinecap="round"/></svg>
+              </button>
+            </div>
+
+            <div className="p-4 sm:p-7 flex flex-col gap-4 overflow-y-auto max-h-[72vh]">
+              {/* Label selector */}
+              <div>
+                <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-2">Address Label</label>
+                <div className="flex gap-2 flex-wrap">
+                  {["Home", "Work", "Shop", "Other"].map((lbl) => {
+                    const lc = ADDR_LABEL_COLORS[lbl] ?? ADDR_LABEL_COLORS["Other"];
+                    const active = addrModal.form.label === lbl;
+                    return (
+                      <button key={lbl} type="button" onClick={() => setAddrField("label", lbl)}
+                        className="px-4 py-1.5 rounded-lg text-xs font-semibold border-2 transition-all"
+                        style={active ? { borderColor: lc.color, backgroundColor: lc.bg, color: lc.color } : { borderColor: "#e2e8f0", backgroundColor: "white", color: "#6d7a6f" }}>
+                        {lbl}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-1.5">Full Name *</label>
+                  <input type="text" value={addrModal.form.name ?? ""} onChange={(e) => setAddrField("name", e.target.value)}
+                    placeholder="Name on address" className={INPUT_CLS}
+                    onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = "#e2e8f0")} />
+                </div>
+                <div>
+                  <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-1.5">Phone Number</label>
+                  <input type="tel" value={addrModal.form.phone ?? ""} onChange={(e) => setAddrField("phone", e.target.value.replace(/[^0-9+]/g, ""))}
+                    placeholder="9876543210 (10-digit number)" className={INPUT_CLS}
+                    onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = "#e2e8f0")} />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-1.5">Address Line 1 *</label>
+                <input type="text" value={addrModal.form.line1 ?? ""} onChange={(e) => setAddrField("line1", e.target.value)}
+                  placeholder="Flat/House No., Building, Street" className={INPUT_CLS}
+                  onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = "#e2e8f0")} />
+              </div>
+
+              <div>
+                <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-1.5">
+                  Address Line 2 <span className="font-normal normal-case text-[#c0ccc0]">(optional)</span>
+                </label>
+                <input type="text" value={addrModal.form.line2 ?? ""} onChange={(e) => setAddrField("line2", e.target.value)}
+                  placeholder="Area, Landmark, Colony" className={INPUT_CLS}
+                  onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = "#e2e8f0")} />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                {[
+                  { key: "city",    label: "City *",    ph: "Mumbai" },
+                  { key: "state",   label: "State *",   ph: "Maharashtra" },
+                  { key: "pincode", label: "Pincode *", ph: "400001" },
+                ].map((f) => (
+                  <div key={f.key}>
+                    <label className="text-[10px] font-bold text-[#073b4c] uppercase tracking-[0.8px] block mb-1.5">{f.label}</label>
+                    <input type="text" value={(addrModal.form as Record<string, string>)[f.key] ?? ""} onChange={(e) => setAddrField(f.key, e.target.value)}
+                      placeholder={f.ph} className={INPUT_CLS}
+                      onFocus={(e) => (e.target.style.borderColor = accent)} onBlur={(e) => (e.target.style.borderColor = "#e2e8f0")} />
+                  </div>
+                ))}
+              </div>
+
+              <label className="flex items-center gap-3 cursor-pointer">
+                <input type="checkbox" checked={addrModal.form.isDefault ?? false}
+                  onChange={(e) => setAddrField("isDefault", e.target.checked)}
+                  className="w-4 h-4 rounded" style={{ accentColor: accent }} />
+                <span className="text-sm text-[#073b4c] font-medium">Set as default delivery address</span>
+              </label>
+            </div>
+
+            {addrError && (
+              <div className="mx-4 sm:mx-7 mb-3 p-3 rounded-xl bg-red-50 border border-red-200 text-red-600 text-xs font-medium">
+                {addrError}
+              </div>
+            )}
+
+            <div className="flex gap-3 px-4 sm:px-7 pb-4 sm:pb-7 pt-2">
+              <button
+                type="button"
+                disabled={addrSaving}
+                onClick={closeAddrModal}
+                className="flex-1 py-3 rounded-xl border-2 border-[#e2e8f0] text-[#073b4c] text-sm font-bold hover:bg-[#f1f5f9] transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={addrSaving}
+                onClick={saveAddress}
+                className="flex-1 py-3 rounded-xl text-white text-sm font-bold hover:opacity-90 transition-opacity disabled:opacity-50 flex items-center justify-center gap-2"
+                style={{ backgroundColor: accent }}
+              >
+                {addrSaving ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    <span>Saving to Database…</span>
+                  </>
+                ) : (
+                  addrModal.mode === "add" ? "Add Address" : "Save Changes"
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Review Submission Modal ── */}
+      {reviewModal.open && (
+        <div
+          className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 overflow-y-auto"
+          onClick={() => setReviewModal((p) => ({ ...p, open: false }))}
+        >
+          <div
+            className="bg-white rounded-2xl w-full max-w-[520px] shadow-2xl my-4 overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-5 sm:px-6 py-4 border-b border-[#e2e8f0]">
+              <div>
+                <h3 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-base sm:text-lg">
+                  Write Product Review
+                </h3>
+                <p className="text-xs text-[#6d7a6f]">{reviewModal.productName}</p>
+              </div>
+              <button
+                onClick={() => setReviewModal((p) => ({ ...p, open: false }))}
+                className="w-8 h-8 rounded-full bg-[#f1f5f9] flex items-center justify-center hover:bg-[#e2e8f0] transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!reviewModal.comment.trim()) return;
+                setReviewModal((p) => ({ ...p, submitting: true }));
+
+                const reviewerName = user.name || (user.role === "retailer" ? "Verified Retailer" : "Verified Customer");
+                const { data, error } = await submitReview({
+                  user_id: user.id,
+                  user_name: reviewerName,
+                  user_role: user.role,
+                  rating: reviewModal.rating,
+                  title: reviewModal.title,
+                  comment: reviewModal.comment,
+                  verified_purchase: true,
+                });
+
+                setReviewModal((p) => ({ ...p, submitting: false }));
+
+                if (data) {
+                  setDbReviews((prev) => [data, ...prev]);
+                  setReviewModal({
+                    open: false,
+                    productName: "",
+                    rating: 5,
+                    title: "",
+                    comment: "",
+                    submitting: false,
+                  });
+                } else if (error) {
+                  alert("Could not post review: " + error);
+                }
+              }}
+              className="p-5 sm:p-6 flex flex-col gap-4"
+            >
+              <div>
+                <label className="block text-xs font-bold text-[#073b4c] mb-1.5">Rating *</label>
+                <div className="flex items-center gap-1.5">
+                  {[1, 2, 3, 4, 5].map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      onClick={() => setReviewModal((p) => ({ ...p, rating: s }))}
+                      className="p-1 hover:scale-125 transition-transform"
+                    >
+                      <svg width="24" height="24" viewBox="0 0 14 14" fill="none">
+                        <path
+                          d="M7 1L8.854 5.09L13.5 5.835L10.25 8.995L11.021 13.5L7 11.277L2.979 13.5L3.75 8.995L0.5 5.835L5.146 5.09Z"
+                          fill={s <= reviewModal.rating ? "#f59e0b" : "#e5e7eb"}
+                        />
+                      </svg>
+                    </button>
+                  ))}
+                  <span className="text-xs font-semibold text-[#6d7a6f] ml-2">
+                    {reviewModal.rating} out of 5 Stars
+                  </span>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-[#073b4c] mb-1">Headline (Optional)</label>
+                <input
+                  type="text"
+                  value={reviewModal.title}
+                  onChange={(e) => setReviewModal((p) => ({ ...p, title: e.target.value }))}
+                  placeholder={user.role === "retailer" ? "e.g. Fresh stock, excellent retail margins" : "e.g. Fast acting and genuine quality"}
+                  className={INPUT_CLS}
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-[#073b4c] mb-1">Your Review *</label>
+                <textarea
+                  required
+                  rows={3}
+                  value={reviewModal.comment}
+                  onChange={(e) => setReviewModal((p) => ({ ...p, comment: e.target.value }))}
+                  placeholder="Describe your experience with this item..."
+                  className={INPUT_CLS}
+                />
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setReviewModal((p) => ({ ...p, open: false }))}
+                  className="flex-1 py-2.5 rounded-xl border border-[#e2e8f0] text-xs sm:text-sm font-bold text-[#6d7a6f] hover:bg-[#f1f5f9] transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={reviewModal.submitting || !reviewModal.comment.trim()}
+                  className="flex-1 py-2.5 rounded-xl text-white text-xs sm:text-sm font-bold hover:opacity-90 transition-opacity disabled:opacity-50 flex items-center justify-center gap-2"
+                  style={{ backgroundColor: accent }}
+                >
+                  {reviewModal.submitting ? "Posting..." : "Submit Review"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

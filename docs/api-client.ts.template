@@ -1,0 +1,18 @@
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "https://api.example.com";
+
+export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const token = await getAccessToken(); // implement using your auth provider
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init.headers || {}),
+    },
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || `API ${response.status}`);
+  }
+  return response.json();
+}

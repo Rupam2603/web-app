@@ -1,0 +1,1096 @@
+import { useState, useEffect, useMemo } from "react";
+import { useCart } from "../contexts/CartContext";
+import { useAuth } from "../contexts/AuthContext";
+import { useModalBackHandler } from "../lib/navigation";
+import { subscribeToProductsRealtime } from "../lib/products";
+import {
+  fetchProductReviews,
+  submitReview,
+  markReviewHelpful,
+  subscribeToReviewsRealtime,
+  type DbReview,
+} from "../lib/reviews";
+
+export interface PopupProduct {
+  id: number;
+  dbId?: string;
+  name: string;
+  sub: string;
+  subCat?: string;
+  price: string;
+  orig: string;
+  disc: string;
+  cat: string;
+  brand: string;
+  img: string;
+  stock?: number;
+  customer_price?: number;
+  retailer_price?: number;
+  return_policy?: string;
+}
+
+export const CAT_COLORS: Record<string, string> = {
+  "Skin Care & Ointments":          "#7c3aed",
+  "Pain Relief & Muscle Care":       "#c0392b",
+  "Weight Loss & Metabolism":       "#ea580c",
+  "Daily Wellness & Immunity":      "#d97706",
+  "Monsoon Health & Antiseptics":    "#0891b2",
+  "Baby Care & Infant Nutrition":   "#0284c7",
+  "Women's Health & Hygiene":       "#db2777",
+  "Men's Health & Vitality":        "#0f766e",
+  "Diet & Digestive Health":        "#16a34a",
+  "Hair Care & Scalp Therapy":      "#9333ea",
+  "Vaccines & Medical Disposables": "#475569",
+  "Medical Supplies & Devices":      "#37474f",
+  "Skin Care, Powders & Ointments":  "#7c3aed",
+  "Pain Relief & Balms":             "#c0392b",
+  "Energy, Hydration & Supplements": "#e07b00",
+  "First Aid & Antiseptics":         "#006a39",
+  "Antacids, Digestion & Laxatives": "#0077b6",
+  "Personal Care, Hygiene & Others": "#00838f",
+  "Baby Care":                       "#0077b6",
+  "Medical Supplies & General":      "#37474f",
+  "Health & Pharmacy Insurance":     "#0284c7",
+  "Full Body Health Checkups":       "#059669",
+};
+
+export const HSN_BY_CAT: Record<string, string> = {
+  "Skin Care & Ointments":          "3304",
+  "Pain Relief & Muscle Care":       "3004",
+  "Weight Loss & Metabolism":       "2106",
+  "Daily Wellness & Immunity":      "2106",
+  "Monsoon Health & Antiseptics":    "3808",
+  "Baby Care & Infant Nutrition":   "3924",
+  "Women's Health & Hygiene":       "3305",
+  "Men's Health & Vitality":        "3004",
+  "Diet & Digestive Health":        "3004",
+  "Hair Care & Scalp Therapy":      "3305",
+  "Vaccines & Medical Disposables": "3002",
+  "Medical Supplies & Devices":      "9018",
+  "Skin Care, Powders & Ointments":  "3304",
+  "Pain Relief & Balms":             "3004",
+  "Energy, Hydration & Supplements": "2106",
+  "First Aid & Antiseptics":         "3808",
+  "Antacids, Digestion & Laxatives": "3004",
+  "Personal Care, Hygiene & Others": "3305",
+  "Baby Care":                       "3924",
+  "Medical Supplies & General":      "9018",
+  "Health & Pharmacy Insurance":     "9971",
+  "Full Body Health Checkups":       "9993",
+};
+
+export function retailerPrice(priceStr: string, explicitRetailerPrice?: number): string {
+  if (typeof explicitRetailerPrice === "number" && !isNaN(explicitRetailerPrice)) {
+    return `₹${Math.round(explicitRetailerPrice)}`;
+  }
+  const n = parseFloat(priceStr.replace(/[₹,]/g, "")) || 0;
+  return `₹${Math.round(n * 0.85)}`;
+}
+
+export function nameToId(name: string): number {
+  let h = 5381;
+  for (let i = 0; i < name.length; i++) h = ((h << 5) + h + name.charCodeAt(i)) | 0;
+  return (Math.abs(h) % 80) + 1;
+}
+
+// Real customers only: No fake or seeded review pool
+export function getProductReviews(_productId?: number) {
+  return [];
+}
+
+const CATEGORY_FEATURES: Record<string, string[]> = {
+  "Skin Care & Ointments":          ["Dermatologically tested and clinically proven", "Suitable for sensitive and normal skin types", "Free from parabens, sulfates, and harsh dyes", "Provides 12-hour protection with regular use"],
+  "Pain Relief & Muscle Care":       ["Fast-acting formula with targeted deep relief", "Proven for back pain, joint aches, and sprains", "Non-greasy; absorbs quickly into skin", "Safe for daily use on adults"],
+  "Weight Loss & Metabolism":       ["Natural dietary fiber and metabolism boosters", "Sugar-free formulation supporting healthy weight goals", "Supports digestive balance and gut microbiome", "Safe for daily dietary supplementation"],
+  "Daily Wellness & Immunity":      ["Enriched with electrolytes and essential vitamins", "Instant glucose replenishment after activity", "Pleasant taste; dissolves easily in water", "Safe for adults and children above 2 years"],
+  "Monsoon Health & Antiseptics":    ["Kills 99.9% of bacteria and germs on contact", "Non-stinging formula safe for all skin types", "Promotes faster healing of minor wounds", "Suitable for cuts, burns, and abrasions"],
+  "Baby Care & Infant Nutrition":   ["Clinically tested for infant skin safety", "Hypoallergenic and paediatrician recommended", "No harmful dyes, parabens, or fragrances", "Approved for daily use from birth onwards"],
+  "Women's Health & Hygiene":       ["pH-balanced formula preserving natural intimate microflora", "Hypoallergenic and gynecologist tested", "Gentle everyday hygiene with long-lasting freshness", "Cruelty-free and responsibly manufactured"],
+  "Men's Health & Vitality":        ["Formulated specifically for active men's wellness", "Long-lasting protection against odor and irritation", "Energizing ingredients supporting physical stamina", "Dermatologically tested for daily grooming"],
+  "Diet & Digestive Health":        ["Provides acid relief within 3–5 minutes", "Balances stomach pH safely and effectively", "No artificial preservatives or harsh chemicals", "Safe for regular use; non-habit forming"],
+  "Hair Care & Scalp Therapy":      ["Pure herbal nourishment for strong hair roots", "Controls dandruff and soothes itchy scalp", "Non-sticky formula with cold-pressed natural oils", "Promotes natural thickness and healthy shine"],
+  "Vaccines & Medical Disposables": ["Hospital-grade sterile disposal standards", "Meets strict national clinical certifications", "Certified safe for diagnostic and clinical use", "Latex-free and biocompatible materials"],
+  "Medical Supplies & Devices":      ["Medical-grade quality with ISO certification", "Sterile packaging for safe hygienic use", "Meets national and international safety standards", "Suitable for both home and clinical settings"],
+  // Backward compatibility
+  "Pain Relief & Balms":             ["Fast-acting formula with targeted deep relief", "Proven for back pain, joint aches, and sprains", "Non-greasy; absorbs quickly into skin", "Safe for daily use on adults"],
+  "Energy, Hydration & Supplements": ["Enriched with electrolytes and essential vitamins", "Instant glucose replenishment after activity", "Pleasant taste; dissolves easily in water", "Safe for adults and children above 2 years"],
+  "First Aid & Antiseptics":         ["Kills 99.9% of bacteria and germs on contact", "Non-stinging formula safe for all skin types", "Promotes faster healing of minor wounds", "Suitable for cuts, burns, and abrasions"],
+  "Antacids, Digestion & Laxatives": ["Provides acid relief within 3–5 minutes", "Balances stomach pH safely and effectively", "No artificial preservatives or harsh chemicals", "Safe for regular use; non-habit forming"],
+  "Skin Care, Powders & Ointments":  ["Dermatologically tested and clinically proven", "Suitable for sensitive and normal skin types", "Free from parabens, sulfates, and harsh dyes", "Provides 12-hour protection with regular use"],
+  "Personal Care, Hygiene & Others": ["Gentle daily-use formula for all skin types", "Paraben-free and dermatologist approved", "Long-lasting freshness with no irritation", "Cruelty-free and responsibly manufactured"],
+  "Baby Care":                       ["Clinically tested for infant skin safety", "Hypoallergenic and paediatrician recommended", "No harmful dyes, parabens, or fragrances", "Approved for daily use from birth onwards"],
+  "Medical Supplies & General":      ["Medical-grade quality with ISO certification", "Sterile packaging for safe hygienic use", "Meets national and international safety standards", "Suitable for both home and clinical settings"],
+};
+
+const CATEGORY_DESCRIPTIONS: Record<string, string> = {
+  "Skin Care & Ointments":          "Dermatologically tested formula designed to soothe, protect, and nourish skin. Free from harsh chemicals and suitable for daily use. Provides lasting relief from common skin concerns while maintaining the skin's natural barrier.",
+  "Pain Relief & Muscle Care":       "Targeted pain relief formulated with proven analgesic and anti-inflammatory agents. Penetrates fast to provide sustained relief from muscle soreness, joint pain, and stiffness. Ideal for back pain, neck aches, sports injuries, and post-workout recovery.",
+  "Weight Loss & Metabolism":       "Scientifically formulated nutritional supplements designed to support healthy metabolic function and energy levels. Enriched with natural dietary fibers and calorie-control active extracts.",
+  "Daily Wellness & Immunity":      "A trusted nutritional formulation enriched with essential glucose, electrolytes, and micronutrients. Replenishes energy reserves, restores hydration balance, and supports active wellness throughout the day. Suitable for all age groups.",
+  "Monsoon Health & Antiseptics":    "Clinically proven antiseptic formulation that eliminates pathogens on contact. Safe for use on cuts, abrasions, minor burns, and skin injuries. Promotes healing while protecting against secondary infections.",
+  "Baby Care & Infant Nutrition":   "Specially formulated for the delicate needs of infant skin. Hypoallergenic, paediatrician-recommended, and free from harmful chemicals. Provides safe, gentle care that parents can trust for everyday use.",
+  "Women's Health & Hygiene":       "Gentle pH-balanced personal care formulation designed for everyday intimate hygiene. Prevents discomfort, maintains natural microbiome balance, and keeps skin feeling clean and confident.",
+  "Men's Health & Vitality":        "Specialized grooming and vitality formulation engineered for modern men. Delivers fast, effective relief, deep cleansing, and reliable freshness throughout intense physical activity.",
+  "Diet & Digestive Health":        "Fast-acting digestive relief formulation that neutralises excess gastric acid within minutes. Alleviates heartburn, acid reflux, bloating, and indigestion discomfort. Gentle on the stomach lining with no harsh side effects.",
+  "Hair Care & Scalp Therapy":      "Therapeutic hair and scalp formulation enriched with herbal botanicals and essential micronutrients. Strengthens folicles from root to tip, relieves scalp dryness, and restores vibrant texture.",
+  "Vaccines & Medical Disposables": "Certified clinical disposables and immunization supplies manufactured under stringent cold-chain and sterilization protocols. Trusted by healthcare professionals for patient care.",
+  "Medical Supplies & Devices":      "Medical-grade quality product manufactured to international safety standards. Designed for reliable, consistent performance across clinical and home use. Rigorous quality control ensures every unit meets strict safety requirements.",
+  // Backward compatibility
+  "Pain Relief & Balms":             "Targeted pain relief formulated with proven analgesic and anti-inflammatory agents. Penetrates fast to provide sustained relief from muscle soreness, joint pain, and stiffness. Ideal for back pain, neck aches, sports injuries, and post-workout recovery.",
+  "Energy, Hydration & Supplements": "A trusted nutritional formulation enriched with essential glucose, electrolytes, and micronutrients. Replenishes energy reserves, restores hydration balance, and supports active wellness throughout the day. Suitable for all age groups.",
+  "First Aid & Antiseptics":         "Clinically proven antiseptic formulation that eliminates pathogens on contact. Safe for use on cuts, abrasions, minor burns, and skin injuries. Promotes healing while protecting against secondary infections.",
+  "Antacids, Digestion & Laxatives": "Fast-acting digestive relief formulation that neutralises excess gastric acid within minutes. Alleviates heartburn, acid reflux, bloating, and indigestion discomfort. Gentle on the stomach lining with no harsh side effects.",
+  "Skin Care, Powders & Ointments":  "Dermatologically tested formula designed to soothe, protect, and nourish skin. Free from harsh chemicals and suitable for daily use. Provides lasting relief from common skin concerns while maintaining the skin's natural barrier.",
+  "Personal Care, Hygiene & Others": "Premium hygiene formulation that delivers effective cleansing and lasting freshness. Clinically tested, dermatologist approved, and safe for everyday use. Gentle yet thorough, with no parabens or harsh additives.",
+  "Baby Care":                       "Specially formulated for the delicate needs of infant skin. Hypoallergenic, paediatrician-recommended, and free from harmful chemicals. Provides safe, gentle care that parents can trust for everyday use.",
+  "Medical Supplies & General":      "Medical-grade quality product manufactured to international safety standards. Designed for reliable, consistent performance across clinical and home use. Rigorous quality control ensures every unit meets strict safety requirements.",
+};
+
+export function StarRow({ rating, size = 13 }: { rating: number; size?: number }) {
+  return (
+    <div className="flex items-center gap-0.5">
+      {[1, 2, 3, 4, 5].map((s) => {
+        const filled = s <= Math.floor(rating);
+        const half   = !filled && s - 0.5 <= rating;
+        return (
+          <svg key={s} width={size} height={size} viewBox="0 0 14 14" fill="none">
+            <defs>
+              <linearGradient id={`pm-h${s}`} x1="0" x2="1" y1="0" y2="0">
+                <stop offset="50%" stopColor="#f59e0b" />
+                <stop offset="50%" stopColor="#e5e7eb" />
+              </linearGradient>
+            </defs>
+            <path
+              d="M7 1L8.854 5.09L13.5 5.835L10.25 8.995L11.021 13.5L7 11.277L2.979 13.5L3.75 8.995L0.5 5.835L5.146 5.09Z"
+              fill={filled ? "#f59e0b" : half ? `url(#pm-h${s})` : "#e5e7eb"}
+            />
+          </svg>
+        );
+      })}
+    </div>
+  );
+}
+
+const RATING_LABELS: Record<number, string> = {
+  1: "1 Star - Poor quality",
+  2: "2 Stars - Fair / Below average",
+  3: "3 Stars - Good / Average",
+  4: "4 Stars - Very Good / Recommended",
+  5: "5 Stars - Excellent / Outstanding!",
+};
+
+export default function ProductDetailModal({
+  product,
+  isRetailer = true,
+  onClose,
+}: {
+  product: PopupProduct;
+  isRetailer?: boolean;
+  onClose: () => void;
+}) {
+  useModalBackHandler(true, onClose, `product-${product.id}`);
+
+  const { addToCart } = useCart();
+  const { appUser } = useAuth();
+  
+  const effectiveIsRetailer = appUser?.profile?.role === "admin" ? isRetailer : true;
+
+  const [liveStock, setLiveStock] = useState<number>(product.stock ?? 50);
+  const [qty, setQty] = useState(1);
+  const [dbReviews, setDbReviews] = useState<DbReview[]>([]);
+  const [showReviewForm, setShowReviewForm] = useState(false);
+  const [reviewRating, setReviewRating] = useState(5);
+  const [hoverRating, setHoverRating] = useState(0);
+  const [reviewTitle, setReviewTitle] = useState("");
+  const [reviewComment, setReviewComment] = useState("");
+  const [submittingReview, setSubmittingReview] = useState(false);
+  const [reviewSuccess, setReviewSuccess] = useState(false);
+  const [reviewFilter, setReviewFilter] = useState<"all" | "customer" | "retailer" | number>("all");
+  const [likedReviews, setLikedReviews] = useState<string[]>([]);
+
+  const allReviews = useMemo(() => {
+    return dbReviews.map((r) => ({
+      id: r.id,
+      name: r.user_name,
+      role: r.user_role || "customer",
+      rating: r.rating,
+      date: new Date(r.created_at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+      verified: r.verified_purchase,
+      helpful: r.helpful_count || 0,
+      title: r.title || "Verified Customer Review",
+      text: r.comment,
+    }));
+  }, [dbReviews]);
+
+  const filteredReviews = useMemo(() => {
+    if (reviewFilter === "all") return allReviews;
+    if (typeof reviewFilter === "number") return allReviews.filter((r) => r.rating === reviewFilter);
+    return allReviews;
+  }, [allReviews, reviewFilter]);
+
+  const avgRating = allReviews.length
+    ? allReviews.reduce((s, r) => s + r.rating, 0) / allReviews.length
+    : 0;
+
+  const accentColor = CAT_COLORS[product.cat] || "#006a39";
+  const features = CATEGORY_FEATURES[product.cat] ?? ["Quality assured", "Genuine product", "Fast delivery", "Clinically tested"];
+  const description = CATEGORY_DESCRIPTIONS[product.cat] ?? `${product.name} is a quality product by ${product.brand}, trusted by customers and retailers across India.`;
+  const hsn = HSN_BY_CAT[product.cat] ?? "—";
+
+  const ratingBreakdown = [5, 4, 3, 2, 1].map((star) => ({
+    star,
+    count: allReviews.filter((r) => r.rating === star).length,
+  }));
+
+  useEffect(() => {
+    let mounted = true;
+    fetchProductReviews(product.id, product.dbId).then((revs) => {
+      if (mounted && revs) setDbReviews(revs);
+    });
+
+    const unsubscribeReviews = subscribeToReviewsRealtime(product.id, product.dbId, (payload) => {
+      if (payload.eventType === "INSERT" && payload.new) {
+        setDbReviews((prev) => [payload.new!, ...prev]);
+      } else if (payload.eventType === "UPDATE" && payload.new) {
+        setDbReviews((prev) => prev.map((r) => (r.id === payload.new!.id ? payload.new! : r)));
+      }
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribeReviews();
+    };
+  }, [product.id, product.dbId]);
+
+  useEffect(() => {
+    setLiveStock(product.stock ?? 50);
+    const unsubscribeStock = subscribeToProductsRealtime((payload) => {
+      if (payload.eventType === "UPDATE" && payload.new) {
+        if (
+          payload.new.id === (product as any).dbId ||
+          payload.new.numeric_id === product.id ||
+          payload.new.name.trim().toLowerCase() === product.name.trim().toLowerCase()
+        ) {
+          setLiveStock(payload.new.stock);
+        }
+      }
+    });
+    return () => unsubscribeStock();
+  }, [product]);
+
+  useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", handleEsc);
+    // Don't lock body scroll — the modal backdrop handles touch containment
+    return () => {
+      document.removeEventListener("keydown", handleEsc);
+      // Ensure body scroll is never left locked
+      document.body.style.overflow = "";
+      document.documentElement.style.overflow = "";
+    };
+  }, [onClose]);
+
+  const isOutOfStock = liveStock <= 0;
+  const isLowStock = liveStock > 0 && liveStock <= (isRetailer ? 20 : 10);
+
+  const handleReviewSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!reviewComment.trim()) return;
+
+    if (!appUser?.authUser && !appUser?.profile) {
+      alert("Please sign in to your customer account to submit a product review.");
+      return;
+    }
+
+    setSubmittingReview(true);
+    const reviewerName =
+      appUser?.profile?.full_name ||
+      (appUser?.authUser?.user_metadata?.full_name as string) ||
+      "Verified Customer";
+
+    const reviewerRole = "customer";
+
+    const { data, error } = await submitReview({
+      product_id: product.dbId || null,
+      product_numeric_id: product.id,
+      user_id: appUser?.authUser?.id || appUser?.profile?.id || null,
+      user_name: reviewerName,
+      user_role: reviewerRole,
+      rating: reviewRating,
+      title: reviewTitle.trim() || undefined,
+      comment: reviewComment.trim(),
+      verified_purchase: true,
+    });
+
+    setSubmittingReview(false);
+
+    if (data) {
+      setDbReviews((prev) => [data, ...prev.filter((r) => r.id !== data.id)]);
+      setReviewComment("");
+      setReviewTitle("");
+      setReviewSuccess(true);
+      setShowReviewForm(false);
+      setTimeout(() => setReviewSuccess(false), 4000);
+    } else if (error) {
+      alert("Could not submit review: " + error);
+    }
+  };
+
+  const handleHelpfulClick = async (reviewId: string) => {
+    if (likedReviews.includes(reviewId)) return;
+    setLikedReviews((prev) => [...prev, reviewId]);
+    await markReviewHelpful(reviewId);
+  };
+
+  return (
+    <div
+      className="fixed inset-0 bg-[#07242e]/70 backdrop-blur-xl z-50 flex items-end sm:items-center justify-center p-0 sm:p-5 overflow-y-auto animate-in fade-in duration-200"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white/95 backdrop-blur-2xl border border-white/80 rounded-t-3xl sm:rounded-3xl w-full max-w-[920px] shadow-2xl max-h-[90dvh] sm:max-h-[92vh] overflow-y-auto flex flex-col relative animate-in zoom-in-95 duration-150"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Top Product Details Section */}
+        <div className="flex flex-col md:flex-row shrink-0 border-b border-[#e4ede2]/80">
+          {/* Image panel */}
+          <div className="w-full md:w-72 shrink-0 flex flex-col border-b md:border-b-0 md:border-r border-[#e4ede2]/80" style={{ backgroundColor: accentColor + "08" }}>
+            <div className="relative h-60 sm:h-72 overflow-hidden flex items-center justify-center p-4 bg-white/60 backdrop-blur-md">
+              {product.disc && (
+                <span
+                  className="absolute top-3.5 left-3.5 z-10 text-white text-[10px] font-extrabold px-3 py-1 rounded-full uppercase shadow-xs border border-white/30 backdrop-blur-md"
+                  style={{ backgroundColor: accentColor }}
+                >
+                  {product.disc} OFF
+                </span>
+              )}
+              <img
+                src={product.img}
+                alt={product.name}
+                className="w-full h-full object-contain mix-blend-multiply"
+                onError={(e) => { (e.target as HTMLImageElement).style.opacity = "0.12"; }}
+              />
+            </div>
+            <div className="flex-1 p-4 sm:p-5 grid grid-cols-2 md:flex md:flex-col gap-3 bg-white/70 backdrop-blur-md">
+              <div>
+                <p className="text-[9px] font-extrabold uppercase tracking-[0.7px] text-[#8aa08e] mb-1">Category</p>
+                <span
+                  className="inline-block text-xs font-bold px-3 py-1 rounded-xl text-white shadow-xs border border-white/20"
+                  style={{ backgroundColor: accentColor }}
+                >
+                  {product.cat}
+                </span>
+              </div>
+              {product.subCat && (
+                <div>
+                  <p className="text-[9px] font-extrabold uppercase tracking-[0.7px] text-[#8aa08e] mb-1">Sub-Category</p>
+                  <span className="inline-block text-xs font-bold px-3 py-1 rounded-xl text-[#006a39] bg-emerald-50 border border-emerald-200/80 shadow-xs">
+                    {product.subCat}
+                  </span>
+                </div>
+              )}
+              <div>
+                <p className="text-[9px] font-extrabold uppercase tracking-[0.7px] text-[#8aa08e] mb-1">Brand</p>
+                <p className="text-xs font-extrabold text-[#073b4c]">{product.brand}</p>
+              </div>
+              <div>
+                <p className="text-[9px] font-extrabold uppercase tracking-[0.7px] text-[#8aa08e] mb-1">HSN Code</p>
+                <p className="text-xs font-mono text-[#6d7a6f]">{hsn}</p>
+              </div>
+              <div>
+                <p className="text-[9px] font-extrabold uppercase tracking-[0.7px] text-[#8aa08e] mb-1">Live Stock Availability</p>
+                {isOutOfStock ? (
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-extrabold text-rose-700 bg-rose-50 border border-rose-200 px-2.5 py-0.5 rounded-full">
+                    <span className="w-2 h-2 rounded-full bg-rose-600 animate-ping inline-block" />
+                    {isRetailer ? "Stock Out (0 units)" : "Out of Stock"}
+                  </span>
+                ) : isLowStock ? (
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2.5 py-0.5 rounded-full animate-pulse">
+                    <span className="w-2 h-2 rounded-full bg-amber-500 inline-block" />
+                    {isRetailer ? `Low Stock (${liveStock} units)` : `Only ${liveStock} Left!`}
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-bold text-[#047857] bg-[#d1fae5] px-2 py-0.5 rounded-md">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />
+                    {isRetailer ? `📦 ${liveStock} units in stock` : `${liveStock} units in stock`}
+                  </span>
+                )}
+              </div>
+              <div>
+                <p className="text-[9px] font-extrabold uppercase tracking-[0.7px] text-[#8aa08e] mb-1">Return & Replacement</p>
+                {(product.return_policy === "Returnable (within 7 days)") ? (
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-xl">
+                    <svg className="w-3.5 h-3.5 text-emerald-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M16 15v-1a4 4 0 00-4-4H4m0 0l3-3m-3 3l3 3m5 6h5a2 2 0 002-2V7a2 2 0 00-2-2H9a2 2 0 00-2 2v2" />
+                    </svg>
+                    Returnable (7 Days)
+                  </span>
+                ) : (product.return_policy === "7 Days Replacement") ? (
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-blue-800 bg-blue-50 border border-blue-200 px-2.5 py-1 rounded-xl">
+                    <svg className="w-3.5 h-3.5 text-blue-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    7 Days Replacement
+                  </span>
+                ) : (product.return_policy === "Returnable (within 7 days) & 7 Days Replacement") ? (
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-teal-900 bg-teal-50 border border-teal-200 px-2.5 py-1 rounded-xl">
+                    <svg className="w-3.5 h-3.5 text-teal-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                    </svg>
+                    7 Days Return & Replace
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-slate-700 bg-slate-100 border border-slate-200 px-2.5 py-1 rounded-xl">
+                    <svg className="w-3.5 h-3.5 text-slate-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                    </svg>
+                    Non-Returnable
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Product Info panel */}
+          <div className="flex-1 p-5 sm:p-7 flex flex-col gap-4 sm:gap-5">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <span className="text-[10px] font-bold uppercase tracking-wider text-[#9aa89b] block mb-1">
+                  {product.brand}
+                </span>
+                <h2 className="font-['Manrope',sans-serif] font-extrabold text-[#073b4c] text-lg sm:text-2xl leading-tight">
+                  {product.name}
+                </h2>
+                {product.sub && (
+                  <p className="text-[#6d7a6f] text-xs sm:text-sm mt-1">{product.sub}</p>
+                )}
+              </div>
+              <button
+                onClick={onClose}
+                className="w-8 h-8 rounded-full bg-[#f0f4f0] hover:bg-[#e4ede2] text-[#073b4c] flex items-center justify-center shrink-0 transition-colors cursor-pointer"
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Rating pill */}
+            {allReviews.length > 0 ? (
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1.5 bg-[#fef9c3] px-2.5 py-1 rounded-lg">
+                  <StarRow rating={avgRating} size={13} />
+                  <span className="font-bold text-xs text-[#713f12]">{avgRating.toFixed(1)}</span>
+                </div>
+                <span className="text-[#9aa89b] text-xs">({allReviews.length} {allReviews.length === 1 ? "review" : "reviews"})</span>
+                <span className="text-[#9aa89b] text-xs">·</span>
+                <span className="text-[#006a39] text-xs font-semibold">Verified Customer Reviews</span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <span className="text-[#8aa08e] text-xs font-medium">No reviews yet</span>
+                <span className="text-[#9aa89b] text-xs">·</span>
+                <span className="text-[#006a39] text-xs font-semibold">100% Genuine Medicine</span>
+              </div>
+            )}
+
+            {/* Pricing Section */}
+            <div className="p-4 rounded-xl bg-[#f8fafb] border border-[#e4ede2]">
+              {effectiveIsRetailer ? (
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-2xl font-['Manrope',sans-serif] font-extrabold text-[#0369a1]">
+                      {retailerPrice(product.price, product.retailer_price)}
+                    </span>
+                    <span className="text-xs bg-[#dbeafe] text-[#1d4ed8] font-bold px-2 py-0.5 rounded uppercase">
+                      Wholesale B2B Rate
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs text-[#9aa89b]">
+                    <span>Standard MRP:</span>
+                    <span className="line-through">{product.orig || product.price}</span>
+                    <span className="text-[#047857] font-semibold">(15% wholesale pharmacy margin)</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-baseline gap-3">
+                  <span className="text-2xl font-['Manrope',sans-serif] font-extrabold text-[#073b4c]">
+                    {product.price}
+                  </span>
+                  {product.orig && (
+                    <span className="text-sm text-[#9aa89b] line-through">MRP {product.orig}</span>
+                  )}
+                  {product.disc && (
+                    <span className="text-xs font-bold text-[#047857] bg-[#d1fae5] px-2 py-0.5 rounded">
+                      Save {product.disc}
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Description */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5 flex-wrap gap-2">
+                <h4 className="text-xs font-bold uppercase tracking-wider text-[#073b4c]">Description</h4>
+                {product.subCat && (
+                  <span className="text-[11px] font-bold text-[#006a39] bg-[#e8f5ee] border border-[#bbf7d0] px-2.5 py-0.5 rounded-full shadow-2xs">
+                    Sub-Category: {product.subCat}
+                  </span>
+                )}
+              </div>
+              <p className="text-[#6d7a6f] text-xs sm:text-sm leading-relaxed">{description}</p>
+              {product.subCat && (
+                <div className="mt-2 flex items-center gap-2 text-xs bg-[#f4fbf6] border border-[#d2edd9] px-3 py-1.5 rounded-xl">
+                  <span className="text-[#073b4c] font-bold">Category:</span>
+                  <span className="text-[#4b5563]">{product.cat}</span>
+                  <span className="text-[#9ca3af]">•</span>
+                  <span className="text-[#073b4c] font-bold">Sub-Category:</span>
+                  <span className="text-[#006a39] font-extrabold">{product.subCat}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Return & Replacement Policy Banner */}
+            <div className={`p-3.5 rounded-2xl border flex items-start gap-3 transition-all ${
+              (product.return_policy === "Returnable (within 7 days)")
+                ? "bg-emerald-50/70 border-emerald-200/80 text-emerald-950"
+                : (product.return_policy === "7 Days Replacement")
+                ? "bg-blue-50/70 border-blue-200/80 text-blue-950"
+                : (product.return_policy === "Returnable (within 7 days) & 7 Days Replacement")
+                ? "bg-teal-50/70 border-teal-200/80 text-teal-950"
+                : "bg-slate-50/80 border-slate-200/90 text-slate-800"
+            }`}>
+              <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 text-base font-bold shadow-xs ${
+                (product.return_policy === "Returnable (within 7 days)")
+                  ? "bg-emerald-600 text-white"
+                  : (product.return_policy === "7 Days Replacement")
+                  ? "bg-blue-600 text-white"
+                  : (product.return_policy === "Returnable (within 7 days) & 7 Days Replacement")
+                  ? "bg-teal-600 text-white"
+                  : "bg-slate-500 text-white"
+              }`}>
+                {(product.return_policy === "Returnable (within 7 days)") && (
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M16 15v-1a4 4 0 00-4-4H4m0 0l3-3m-3 3l3 3m5 6h5a2 2 0 002-2V7a2 2 0 00-2-2H9a2 2 0 00-2 2v2" />
+                  </svg>
+                )}
+                {(product.return_policy === "7 Days Replacement") && (
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                )}
+                {(product.return_policy === "Returnable (within 7 days) & 7 Days Replacement") && (
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                  </svg>
+                )}
+                {(!product.return_policy || product.return_policy === "Non-Returnable") && (
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                  </svg>
+                )}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs font-black uppercase tracking-wide">
+                    {(product.return_policy === "Returnable (within 7 days)") && "Returnable (Within 7 Days)"}
+                    {(product.return_policy === "7 Days Replacement") && "7 Days Replacement"}
+                    {(product.return_policy === "Returnable (within 7 days) & 7 Days Replacement") && "7 Days Return & Replacement"}
+                    {(!product.return_policy || product.return_policy === "Non-Returnable") && "Non-Returnable Product"}
+                  </span>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-white/80 border border-current/20">
+                    Policy
+                  </span>
+                </div>
+                <p className="text-xs mt-0.5 leading-relaxed opacity-90">
+                  {(product.return_policy === "Returnable (within 7 days)") && "This item can be returned within 7 days of delivery for a full refund if unused, sealed, and in its original packaging."}
+                  {(product.return_policy === "7 Days Replacement") && "Free replacement available within 7 days of delivery in case of damaged, defective, or incorrect medicine received."}
+                  {(product.return_policy === "Returnable (within 7 days) & 7 Days Replacement") && "Complete peace of mind: item is eligible for both a 7-day hassle-free return for refund or a free direct replacement."}
+                  {(!product.return_policy || product.return_policy === "Non-Returnable") && "This item is non-returnable due to health, hygiene, and pharmaceutical safety guidelines. Damaged or wrong items are eligible for prompt replacement."}
+                </p>
+              </div>
+            </div>
+
+            {/* Key Features */}
+            <div>
+              <h4 className="text-xs font-bold uppercase tracking-wider text-[#073b4c] mb-2">Key Highlights</h4>
+              <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                {features.map((feat, i) => (
+                  <li key={i} className="flex items-center gap-2 text-xs text-[#3e4a3f]">
+                    <span className="w-4 h-4 rounded-full bg-[#d1fae5] text-[#047857] flex items-center justify-center text-[10px] shrink-0 font-bold">
+                      ✓
+                    </span>
+                    {feat}
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {/* Quantity Stepper + Add to Cart CTA */}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 pt-2 mt-auto">
+              {!isOutOfStock && (
+                <div className="flex items-center border border-[#dce7db] rounded-2xl overflow-hidden bg-white/80 backdrop-blur-md shrink-0 shadow-2xs">
+                  <button
+                    onClick={() => setQty((q) => Math.max(1, q - 1))}
+                    className="w-10 h-10 flex items-center justify-center text-[#073b4c] hover:bg-emerald-50 font-bold text-base transition-colors cursor-pointer"
+                    aria-label="Decrease quantity"
+                  >
+                    −
+                  </button>
+                  <span className="w-10 text-center font-extrabold text-sm text-[#073b4c]">
+                    {qty}
+                  </span>
+                  <button
+                    onClick={() => setQty((q) => Math.min(liveStock, q + 1))}
+                    className="w-10 h-10 flex items-center justify-center text-[#073b4c] hover:bg-emerald-50 font-bold text-base transition-colors cursor-pointer"
+                    aria-label="Increase quantity"
+                  >
+                    +
+                  </button>
+                </div>
+              )}
+
+              {isOutOfStock ? (
+                <button
+                  disabled
+                  className="flex-1 py-3.5 px-6 rounded-2xl bg-[#f3f4f6] text-[#9ca3af] font-extrabold text-sm cursor-not-allowed border border-slate-200"
+                >
+                  Item Currently Out of Stock
+                </button>
+              ) : (
+                <button
+                  onClick={() => {
+                    const chosenPrice = isRetailer
+                      ? (product.retailer_price ?? retailerPrice(product.price, product.retailer_price))
+                      : product.price;
+
+                    addToCart(
+                      {
+                        id: product.dbId || product.id,
+                        dbId: product.dbId,
+                        numeric_id: product.id,
+                        name: product.name,
+                        brand: product.brand,
+                        cat: product.cat,
+                        price: chosenPrice,
+                        customer_price: product.customer_price,
+                        retailer_price: product.retailer_price,
+                        orig: product.orig,
+                        img: product.img,
+                      },
+                      qty
+                    );
+                    onClose();
+                  }}
+                  className="flex-1 py-3.5 px-6 rounded-2xl text-white font-['Manrope',sans-serif] font-black text-sm shadow-lg shadow-emerald-950/15 hover:opacity-95 active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer border border-white/30"
+                  style={{ backgroundColor: accentColor }}
+                >
+                  <span>Add {qty} to Cart</span>
+                  <span>·</span>
+                  <span>
+                    {isRetailer
+                      ? `₹${(product.retailer_price ?? (parseFloat(retailerPrice(product.price, product.retailer_price).replace(/[₹,]/g, "")) || 0)) * qty}`
+                      : `₹${(parseFloat(product.price.replace(/[₹,]/g, "")) || 0) * qty}`}
+                  </span>
+                </button>
+              )}
+            </div>
+
+            <p className="text-[11px] text-[#9aa89b] text-center sm:text-left">
+              {isRetailer
+                ? "Ready to ship within 24 hours · FREE Delivery on all retailer wholesale orders"
+                : "Ready to ship within 24 hours · Free delivery on orders above ₹150"}
+            </p>
+          </div>
+        </div>
+
+        {/* ── Reviews Section ── */}
+        <div className="border-t border-[#e4ede2] p-4 sm:p-7 bg-[#fafdfa]">
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-6">
+            <div>
+              <h3 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-lg sm:text-xl">
+                Ratings & Reviews
+              </h3>
+              <p className="text-xs text-[#6d7a6f] mt-0.5">
+                Verified reviews from customers and wholesale pharmacy retailers across India.
+              </p>
+            </div>
+            <button
+              onClick={() => setShowReviewForm(!showReviewForm)}
+              className="bg-[#006a39] text-white px-4 py-2 rounded-xl text-xs sm:text-sm font-bold hover:bg-[#005a30] transition-colors shadow-sm shrink-0 flex items-center gap-1.5"
+            >
+              {showReviewForm ? (
+                <>
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                    <path d="M1 1L13 13M1 13L13 1" stroke="white" strokeWidth="1.8" strokeLinecap="round" />
+                  </svg>
+                  <span>Close Form</span>
+                </>
+              ) : (
+                <>
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                    <path d="M7 1V13M1 7H13" stroke="white" strokeWidth="1.8" strokeLinecap="round" />
+                  </svg>
+                  <span>Write a Review</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {reviewSuccess && (
+            <div className="mb-6 p-4 rounded-xl bg-[#d1fae5] border border-[#a7f3d0] text-[#065f46] text-xs sm:text-sm font-semibold flex items-center justify-between gap-2 animate-in fade-in">
+              <div className="flex items-center gap-2">
+                <svg width="18" height="18" viewBox="0 0 20 20" fill="#059669">
+                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                </svg>
+                <span>Thank you! Your review has been submitted and published successfully in real-time.</span>
+              </div>
+              <button
+                onClick={() => setReviewSuccess(false)}
+                className="text-[#065f46] hover:text-[#047857] font-bold text-xs"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
+          {/* ── Header & Write Review Button ── */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+            <div>
+              <h3 className="font-['Manrope',sans-serif] font-extrabold text-xl text-[#073b4c]">
+                Verified Customer Reviews
+              </h3>
+              <p className="text-xs text-[#6d7a6f] mt-0.5">
+                Authentic product ratings and feedback submitted directly by verified customers.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setShowReviewForm(!showReviewForm);
+                setReviewSuccess(false);
+              }}
+              className="px-5 py-2.5 rounded-2xl bg-gradient-to-r from-[#006a39] to-[#047857] text-white font-bold text-xs shadow-md shadow-emerald-950/15 hover:opacity-95 transition-all flex items-center gap-2 cursor-pointer self-start sm:self-auto active:scale-95"
+            >
+              <span>{showReviewForm ? "✕ Close Form" : "✍ Write Customer Review"}</span>
+            </button>
+          </div>
+
+          {/* ── Interactive Review Submission Form ── */}
+          {showReviewForm && (
+            <form
+              onSubmit={handleReviewSubmit}
+              className="mb-8 p-5 sm:p-6 bg-white rounded-2xl border-2 border-[#006a39]/30 shadow-xl flex flex-col gap-4 animate-in slide-in-from-top-2 duration-200 relative"
+            >
+              <div className="flex items-center justify-between border-b border-[#f0f4f0] pb-3">
+                <div>
+                  <h4 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-sm sm:text-base">
+                    Write Customer Review
+                  </h4>
+                  <p className="text-[11px] text-[#9aa89b]">Share your genuine experience with this product</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-extrabold uppercase px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300">
+                    ✓ Verified Customer Review
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowReviewForm(false)}
+                    className="w-7 h-7 rounded-full bg-[#f0f4f0] hover:bg-[#e4ede2] text-[#073b4c] flex items-center justify-center font-bold text-xs transition-colors shrink-0"
+                    title="Close review form"
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+
+              {/* Selectable Rating Stars */}
+              <div>
+                <label className="block text-xs font-bold text-[#073b4c] mb-1.5">
+                  Select Your Overall Rating * <span className="font-normal text-[#9aa89b]">(Click star to select)</span>
+                </label>
+                <div className="flex items-center gap-3 bg-[#f8fafb] border border-[#e4ede2] p-3 rounded-xl">
+                  <div className="flex items-center gap-1.5">
+                    {[1, 2, 3, 4, 5].map((star) => (
+                      <button
+                        key={star}
+                        type="button"
+                        onClick={() => setReviewRating(star)}
+                        onMouseEnter={() => setHoverRating(star)}
+                        onMouseLeave={() => setHoverRating(0)}
+                        className="p-1 hover:scale-125 focus:outline-none transition-transform cursor-pointer"
+                        title={`${star} Star${star > 1 ? "s" : ""}`}
+                      >
+                        <svg width="26" height="26" viewBox="0 0 14 14" fill="none">
+                          <path
+                            d="M7 1L8.854 5.09L13.5 5.835L10.25 8.995L11.021 13.5L7 11.277L2.979 13.5L3.75 8.995L0.5 5.835L5.146 5.09Z"
+                            fill={star <= (hoverRating || reviewRating) ? "#f59e0b" : "#e5e7eb"}
+                            stroke={star <= (hoverRating || reviewRating) ? "#d97706" : "#d1d5db"}
+                            strokeWidth="0.5"
+                          />
+                        </svg>
+                      </button>
+                    ))}
+                  </div>
+                  <span className="text-xs font-bold text-[#073b4c] ml-1">
+                    {RATING_LABELS[hoverRating || reviewRating]}
+                  </span>
+                </div>
+              </div>
+
+              {/* Title input */}
+              <div>
+                <label className="block text-xs font-bold text-[#073b4c] mb-1">
+                  Review Headline (Optional)
+                </label>
+                <input
+                  type="text"
+                  value={reviewTitle}
+                  onChange={(e) => setReviewTitle(e.target.value)}
+                  placeholder="e.g. Fast relief, genuine medicine, swift delivery"
+                  className="w-full px-3.5 py-2.5 bg-[#f8fafb] border border-[#d5dcd3] rounded-xl text-xs sm:text-sm text-[#073b4c] focus:outline-none focus:bg-white focus:border-[#006a39]"
+                />
+              </div>
+
+              {/* Comment input */}
+              <div>
+                <label className="block text-xs font-bold text-[#073b4c] mb-1">
+                  Detailed Review *
+                </label>
+                <textarea
+                  required
+                  rows={3}
+                  value={reviewComment}
+                  onChange={(e) => setReviewComment(e.target.value)}
+                  placeholder="Share your experience with the effectiveness, quality, taste/smell, and overall results..."
+                  className="w-full px-3.5 py-2.5 bg-[#f8fafb] border border-[#d5dcd3] rounded-xl text-xs sm:text-sm text-[#073b4c] focus:outline-none focus:bg-white focus:border-[#006a39]"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#f0f4f0]">
+                <button
+                  type="button"
+                  onClick={() => setShowReviewForm(false)}
+                  className="px-4 py-2 text-xs font-bold text-[#6d7a6f] hover:bg-[#f0f4f0] rounded-xl transition-colors flex items-center gap-1"
+                >
+                  <span>✕</span>
+                  <span>Close</span>
+                </button>
+                <button
+                  type="submit"
+                  disabled={submittingReview || !reviewComment.trim()}
+                  className="px-5 py-2.5 bg-[#006a39] text-white rounded-xl text-xs sm:text-sm font-bold hover:bg-[#005a30] transition-colors disabled:opacity-50 flex items-center gap-2 shadow-sm"
+                >
+                  {submittingReview ? (
+                    <>
+                      <div className="w-4 h-4 rounded-full border-2 border-white border-t-transparent animate-spin" />
+                      <span>Posting...</span>
+                    </>
+                  ) : (
+                    <span>Submit Review</span>
+                  )}
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* ── Rating Breakdown & Selectable Overall Stars ── */}
+          {allReviews.length > 0 ? (
+            <div className="flex flex-col sm:flex-row gap-6 sm:gap-10 mb-6 bg-white p-5 rounded-2xl border border-[#e4ede2] shadow-xs">
+              {/* Clickable Overall Stars Card */}
+              <div className="flex sm:flex-col items-center gap-3 sm:gap-2 shrink-0 min-w-[130px] justify-center text-center">
+                <p className="font-['Manrope',sans-serif] font-extrabold text-[#073b4c] text-4xl sm:text-5xl leading-none">
+                  {avgRating.toFixed(1)}
+                </p>
+                <div className="flex flex-col items-center">
+                  <div className="flex items-center gap-1 cursor-pointer" title="Click any star to filter reviews">
+                    {[1, 2, 3, 4, 5].map((s) => (
+                      <button
+                        key={s}
+                        onClick={() => setReviewFilter(reviewFilter === s ? "all" : s)}
+                        className={`p-0.5 transition-transform hover:scale-125 ${
+                          typeof reviewFilter === "number" && reviewFilter >= s ? "scale-110" : ""
+                        }`}
+                        title={`Filter by ${s} Star${s > 1 ? "s" : ""}`}
+                      >
+                        <svg width="18" height="18" viewBox="0 0 14 14" fill="none">
+                          <path
+                            d="M7 1L8.854 5.09L13.5 5.835L10.25 8.995L11.021 13.5L7 11.277L2.979 13.5L3.75 8.995L0.5 5.835L5.146 5.09Z"
+                            fill={s <= Math.round(avgRating) ? "#f59e0b" : "#e5e7eb"}
+                          />
+                        </svg>
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[#9aa89b] text-xs mt-1">{allReviews.length} verified {allReviews.length === 1 ? "review" : "reviews"}</p>
+                  <span className="text-[10px] text-[#006a39] font-semibold mt-0.5">
+                    ★ Click stars to filter
+                  </span>
+                </div>
+              </div>
+
+              {/* Breakdown Bars (Selectable rows) */}
+              <div className="flex flex-col gap-2 flex-1 justify-center">
+                {ratingBreakdown.map(({ star, count }) => {
+                  const isSelected = reviewFilter === star;
+                  return (
+                    <button
+                      key={star}
+                      onClick={() => setReviewFilter(isSelected ? "all" : star)}
+                      className={`flex items-center gap-2 sm:gap-3 px-2 py-1 rounded-lg group text-left cursor-pointer transition-all ${
+                        isSelected ? "bg-[#e8f5ee] ring-2 ring-[#006a39]" : "hover:bg-[#f8fafb]"
+                      }`}
+                      title={`Click to filter ${star} Star reviews`}
+                    >
+                      <span className={`text-xs font-bold w-6 text-right shrink-0 ${
+                        isSelected ? "text-[#006a39]" : "text-[#6d7a6f] group-hover:text-[#006a39]"
+                      }`}>
+                        {star}★
+                      </span>
+                      <div className="flex-1 h-2.5 bg-[#f0f4f0] rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all duration-500"
+                          style={{
+                            width: `${allReviews.length ? (count / allReviews.length) * 100 : 0}%`,
+                            backgroundColor: star >= 4 ? "#006a39" : star === 3 ? "#d97706" : "#b91c1c",
+                          }}
+                        />
+                      </div>
+                      <span className="text-xs font-semibold text-[#9aa89b] w-6 text-right shrink-0">{count}</span>
+                      {isSelected && (
+                        <span className="text-[10px] font-bold text-[#006a39] shrink-0">✓ Selected</span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            <div className="mb-6 bg-white p-6 sm:p-8 rounded-2xl border border-[#e4ede2] text-center shadow-xs">
+              <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-[#006a39] flex items-center justify-center text-xl mx-auto mb-2.5 border border-emerald-200 shadow-2xs">
+                ✍
+              </div>
+              <h4 className="font-['Manrope',sans-serif] font-bold text-[#073b4c] text-sm sm:text-base">
+                No Customer Reviews Yet
+              </h4>
+              <p className="text-xs text-[#6d7a6f] max-w-md mx-auto mt-1 leading-relaxed">
+                Only real, verified customers can review products after ordering. Real customer reviews will appear here once submitted.
+              </p>
+            </div>
+          )}
+
+          {/* ── Review Filtering Chips & Reset ── */}
+          {allReviews.length > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-1 max-w-full" style={{ scrollbarWidth: "none" }}>
+                <button
+                  onClick={() => setReviewFilter("all")}
+                  className={`px-3 py-1 rounded-full text-xs font-semibold transition-colors shrink-0 ${
+                    reviewFilter === "all"
+                      ? "bg-[#006a39] text-white shadow-sm"
+                      : "bg-white border border-[#d5dcd3] text-[#3e4a3f] hover:border-[#006a39]"
+                  }`}
+                >
+                  All Customer Reviews ({allReviews.length})
+                </button>
+
+                <div className="h-4 w-px bg-[#d5dcd3] mx-1 shrink-0" />
+                {[5, 4, 3, 2, 1].map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setReviewFilter(reviewFilter === s ? "all" : s)}
+                    className={`px-2.5 py-1 rounded-full text-xs font-semibold transition-colors shrink-0 flex items-center gap-0.5 ${
+                      reviewFilter === s
+                        ? "bg-[#f59e0b] text-white shadow-sm font-bold"
+                        : "bg-white border border-[#d5dcd3] text-[#6d7a6f] hover:border-[#f59e0b]"
+                    }`}
+                  >
+                    <span>{s}</span>
+                    <span>★</span>
+                  </button>
+                ))}
+              </div>
+
+              {reviewFilter !== "all" && (
+                <button
+                  onClick={() => setReviewFilter("all")}
+                  className="text-xs font-bold text-[#b91c1c] hover:bg-[#fee2e2] bg-[#fef2f2] px-2.5 py-1 rounded-lg transition-colors flex items-center gap-1 shrink-0"
+                >
+                  <span>✕ Clear Filter</span>
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Review List */}
+          <div className="flex flex-col gap-4">
+            {allReviews.length === 0 ? (
+              <div className="bg-white rounded-2xl border border-[#e4ede2] p-8 text-center text-xs text-[#9aa89b]">
+                Be the first real customer to leave a review for this product!
+              </div>
+            ) : filteredReviews.length === 0 ? (
+              <div className="bg-white rounded-2xl border border-[#e4ede2] p-8 text-center text-xs text-[#9aa89b]">
+                No customer reviews found under this filter.
+              </div>
+            ) : (
+              filteredReviews.map((r, idx) => {
+                const isLiked = likedReviews.includes(r.id);
+
+                return (
+                  <div
+                    key={r.id || idx}
+                    className="bg-white rounded-2xl border border-[#e4ede2] p-4 sm:p-5 shadow-xs flex flex-col gap-2.5"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-3">
+                        <div className="w-9 h-9 rounded-full flex items-center justify-center font-bold text-xs text-white shrink-0 bg-[#006a39]">
+                          {(r.name[0] || "C").toUpperCase()}
+                        </div>
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="font-bold text-[#073b4c] text-xs sm:text-sm">{r.name}</p>
+                            <span className="text-[9px] font-bold bg-[#d1fae5] text-[#047857] border border-[#a7f3d0] px-2 py-0.5 rounded-full flex items-center gap-1">
+                              <span>✓</span> Verified Customer
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 mt-1">
+                            <StarRow rating={r.rating} size={12} />
+                            <span className="text-[#9aa89b] text-[10px]">{r.date}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Helpful Button */}
+                      <button
+                        onClick={() => handleHelpfulClick(r.id)}
+                        className={`text-[11px] px-2.5 py-1 rounded-lg border transition-all flex items-center gap-1.5 shrink-0 ${
+                          isLiked
+                            ? "bg-[#e8f5ee] border-[#006a39] text-[#006a39] font-bold"
+                            : "bg-[#f8fafb] border-[#e4ede2] text-[#6d7a6f] hover:bg-[#f0f4f0]"
+                        }`}
+                        title="Mark review as helpful"
+                      >
+                        <span>👍</span>
+                        <span>{r.helpful + (isLiked ? 1 : 0)}</span>
+                      </button>
+                    </div>
+
+                    {r.title && (
+                      <p className="font-bold text-[#073b4c] text-xs sm:text-sm mt-0.5">
+                        {r.title}
+                      </p>
+                    )}
+
+                    <p className="text-[#3e4a3f] text-xs sm:text-sm leading-relaxed">
+                      {r.text}
+                    </p>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
